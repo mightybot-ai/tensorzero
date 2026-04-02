@@ -2045,25 +2045,16 @@ pub(super) async fn prepare_file_message(
                     },
                 })
             } else {
-                // OpenAI doesn't document how they determine the content type of the base64 blob
-                // - let's try to pick a good suffix for the filename, in case they don't sniff
-                // the mime type from the actual file content.
-                let filename = if let Some(ref user_filename) = file.filename {
-                    // Use the user-provided filename if available
-                    Cow::Owned(user_filename.clone())
-                } else {
-                    // Otherwise, generate a filename with the appropriate extension
-                    let suffix = mime_type_to_ext(&file.mime_type)?.ok_or_else(|| {
-                        Error::new(ErrorDetails::InvalidMessage {
-                            message: format!("Mime type {} has no filetype suffix", file.mime_type),
-                        })
-                    })?;
-                    Cow::Owned(format!("input.{suffix}"))
-                };
-                Ok(OpenAIContentBlock::File {
-                    file: OpenAIFile {
-                        file_data: Some(Cow::Owned(base64_url)),
-                        filename: Some(filename),
+                // Send non-image/non-audio files (PDFs, documents, etc.) as `image_url`
+                // with a data URI. This is necessary because some OpenAI-compatible
+                // endpoints (notably Vertex AI) don't support the `file` content block
+                // type, but DO accept data URIs with non-image mime types in `image_url`
+                // blocks. Real OpenAI also accepts this format.
+                // See: https://github.com/tensorzero/tensorzero/discussions/7159
+                Ok(OpenAIContentBlock::ImageUrl {
+                    image_url: OpenAIImageUrl {
+                        url: base64_url,
+                        detail: None,
                     },
                 })
             }
