@@ -603,6 +603,7 @@ pub async fn tensorzero_to_fireworks_assistant_message<'a>(
                         name: Cow::Borrowed(&tool_call.name),
                         arguments: Cow::Borrowed(&tool_call.arguments),
                     },
+                    extra_content: None,
                 });
             }
             Cow::Owned(ContentBlock::ToolCall(tool_call)) => {
@@ -613,6 +614,7 @@ pub async fn tensorzero_to_fireworks_assistant_message<'a>(
                         name: Cow::Owned(tool_call.name),
                         arguments: Cow::Owned(tool_call.arguments),
                     },
+                    extra_content: None,
                 });
             }
             Cow::Borrowed(ContentBlock::ToolResult(_))

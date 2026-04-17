@@ -1338,6 +1338,7 @@ mod tests {
                 name: "func1".into(),
                 arguments: "args1".into(),
             },
+            extra_content: None,
         };
         let tool_call2 = OpenAIRequestToolCall {
             id: "tc2".into(),
@@ -1346,6 +1347,7 @@ mod tests {
                 name: "func2".into(),
                 arguments: "args2".into(),
             },
+            extra_content: None,
         };
 
         // Test 1: Empty input.
