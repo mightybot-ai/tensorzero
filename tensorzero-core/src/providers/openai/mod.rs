@@ -1573,6 +1573,13 @@ pub struct OpenAIRequestToolCall<'a> {
     pub id: Cow<'a, str>,
     pub r#type: OpenAIToolType,
     pub function: OpenAIRequestFunctionCall<'a>,
+    /// Gemini 3 thought_signature bypass for Vertex AI OpenAI-compat endpoint.
+    /// Google requires thought_signature on follow-up turns after tool_calls.
+    /// Since the OpenAI shim strips signatures on response parse, we inject
+    /// the official "skip_thought_signature_validator" bypass on serialization.
+    /// See: https://docs.cloud.google.com/vertex-ai/generative-ai/docs/thought-signatures
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
 }
 
 impl<'a> From<&'a ToolCall> for OpenAIRequestToolCall<'a> {
@@ -1584,6 +1591,7 @@ impl<'a> From<&'a ToolCall> for OpenAIRequestToolCall<'a> {
                 name: Cow::Borrowed(&tool_call.name),
                 arguments: Cow::Borrowed(&tool_call.arguments),
             },
+            extra_content: None,
         }
     }
 }
@@ -1597,6 +1605,7 @@ impl From<ToolCall> for OpenAIRequestToolCall<'static> {
                 name: Cow::Owned(tool_call.name),
                 arguments: Cow::Owned(tool_call.arguments),
             },
+            extra_content: None,
         }
     }
 }
@@ -2123,6 +2132,13 @@ pub async fn tensorzero_to_openai_assistant_message<'a>(
                 });
             }
             Cow::Borrowed(ContentBlock::ToolCall(tool_call)) => {
+                // Gemini 3 thought_signature bypass: inject on the FIRST tool_call
+                // per Google's parallel-call rule (only the first gets a signature).
+                let extra_content = if assistant_tool_calls.is_empty() {
+                    Some(serde_json::json!({"google": {"thought_signature": "skip_thought_signature_validator"}}))
+                } else {
+                    None
+                };
                 let tool_call = OpenAIRequestToolCall {
                     id: Cow::Borrowed(&tool_call.id),
                     r#type: OpenAIToolType::Function,
@@ -2130,11 +2146,17 @@ pub async fn tensorzero_to_openai_assistant_message<'a>(
                         name: Cow::Borrowed(&tool_call.name),
                         arguments: Cow::Borrowed(&tool_call.arguments),
                     },
+                    extra_content,
                 };
 
                 assistant_tool_calls.push(tool_call);
             }
             Cow::Owned(ContentBlock::ToolCall(tool_call)) => {
+                let extra_content = if assistant_tool_calls.is_empty() {
+                    Some(serde_json::json!({"google": {"thought_signature": "skip_thought_signature_validator"}}))
+                } else {
+                    None
+                };
                 let tool_call = OpenAIRequestToolCall {
                     id: Cow::Owned(tool_call.id),
                     r#type: OpenAIToolType::Function,
@@ -2142,6 +2164,7 @@ pub async fn tensorzero_to_openai_assistant_message<'a>(
                         name: Cow::Owned(tool_call.name),
                         arguments: Cow::Owned(tool_call.arguments),
                     },
+                    extra_content,
                 };
 
                 assistant_tool_calls.push(tool_call);
