@@ -2610,9 +2610,22 @@ pub async fn tensorzero_to_gcp_vertex_gemini_content<'a>(
 
 /// Recursively removes fields unsupported by Google's Schema spec
 /// (`$schema`, `additionalProperties`, bare `ref`) from JSON schemas.
+/// Also inlines Pydantic-style `$ref` pointers against the root `$defs`
+/// dictionary and strips `$defs`/`$ref` — Google rejects both as unknown
+/// fields but accepts the fully-resolved equivalent.
 pub(crate) fn process_jsonschema_for_gcp_vertex_gemini(schema: &Value) -> Value {
     let mut schema = schema.clone();
 
+    // Phase 1 — if the root schema carries `$defs`, walk the tree replacing
+    // every `{"$ref": "#/$defs/Name"}` with an inline copy of the target.
+    // Cap recursion to guard against self-referential schemas.
+    if let Value::Object(root) = &schema {
+        if root.contains_key("$defs") {
+            schema = inline_gcp_schema_refs(&schema);
+        }
+    }
+
+    // Phase 2 — strip remaining unsupported fields everywhere.
     fn remove_properties(value: &mut Value) {
         match value {
             Value::Object(obj) => {
@@ -2620,6 +2633,10 @@ pub(crate) fn process_jsonschema_for_gcp_vertex_gemini(schema: &Value) -> Value 
                 obj.remove("$schema");
                 // Bare "ref" (without $) is not a valid Google Schema field
                 obj.remove("ref");
+                // Any leftover $defs/$ref that survived inlining (e.g. bad
+                // refs, or nested $defs we intentionally didn't inline)
+                obj.remove("$defs");
+                obj.remove("$ref");
                 for (_, v) in obj.iter_mut() {
                     remove_properties(v);
                 }
@@ -2635,6 +2652,55 @@ pub(crate) fn process_jsonschema_for_gcp_vertex_gemini(schema: &Value) -> Value 
 
     remove_properties(&mut schema);
     schema
+}
+
+/// Replace `{"$ref": "#/$defs/Name"}` nodes with inline copies of the
+/// referenced schema. Resolves nested refs and drops `$defs` after.
+fn inline_gcp_schema_refs(schema: &Value) -> Value {
+    const MAX_DEPTH: usize = 16;
+
+    let defs = match schema.get("$defs") {
+        Some(Value::Object(m)) => m.clone(),
+        _ => return schema.clone(),
+    };
+
+    fn resolve(
+        value: &Value,
+        defs: &serde_json::Map<String, Value>,
+        depth: usize,
+    ) -> Value {
+        if depth >= MAX_DEPTH {
+            return value.clone();
+        }
+        match value {
+            Value::Object(obj) => {
+                // A plain `{"$ref": "#/$defs/Name"}` node — inline it.
+                if let Some(Value::String(ref_str)) = obj.get("$ref") {
+                    if let Some(name) = ref_str.strip_prefix("#/$defs/") {
+                        if let Some(target) = defs.get(name) {
+                            return resolve(target, defs, depth + 1);
+                        }
+                    }
+                }
+                // Otherwise copy the object, skipping the root-level $defs,
+                // and recurse into every value.
+                let mut out = serde_json::Map::new();
+                for (k, v) in obj {
+                    if k == "$defs" {
+                        continue;
+                    }
+                    out.insert(k.clone(), resolve(v, defs, depth));
+                }
+                Value::Object(out)
+            }
+            Value::Array(arr) => {
+                Value::Array(arr.iter().map(|v| resolve(v, defs, depth)).collect())
+            }
+            _ => value.clone(),
+        }
+    }
+
+    resolve(schema, &defs, 0)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
