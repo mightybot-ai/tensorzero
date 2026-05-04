@@ -1954,8 +1954,22 @@ pub(super) struct GCPVertexGeminiGenerationConfig<'a> {
     seed: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_mime_type: Option<GCPVertexGeminiResponseMimeType>,
+    /// OpenAPI-3.0 subset schema. Used for Gemini < 3. Vertex rejects
+    /// fields like `additionalProperties` / `$defs` here, so we strip
+    /// them via `process_jsonschema_for_gcp_vertex_gemini`. The strip
+    /// turns `dict[str, Any]` Pydantic fields into `{"type": "object"}`
+    /// with no declared keys, which Vertex interprets as "object must
+    /// be empty" — produces empty extractions on schemas that rely on
+    /// permissive objects (e.g. `extracted_data: dict`).
     #[serde(skip_serializing_if = "Option::is_none")]
     response_schema: Option<Value>,
+    /// Full JSON Schema. Supported by Gemini 3 family per Google's docs
+    /// (https://ai.google.dev/gemini-api/docs/structured-output). When
+    /// using this field, `additionalProperties`, `$defs`, `$ref`, etc.
+    /// are preserved — the model can emit arbitrary keys for permissive
+    /// object types. Selected via `model_supports_response_json_schema`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_json_schema: Option<Value>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -2005,6 +2019,7 @@ fn apply_inference_params(
                 seed: None,
                 response_mime_type: None,
                 response_schema: None,
+                response_json_schema: None,
             });
         }
     }
@@ -2052,18 +2067,41 @@ impl<'a> GCPVertexGeminiRequest<'a> {
         .filter(|m| !m.parts.is_empty())
         .collect();
         let (tools, tool_config) = prepare_tools(request, model_name)?;
-        let (response_mime_type, response_schema) = match request.json_mode {
-            ModelInferenceRequestJsonMode::On | ModelInferenceRequestJsonMode::Strict => {
-                match request.output_schema {
-                    Some(output_schema) => (
-                        Some(GCPVertexGeminiResponseMimeType::ApplicationJson),
-                        Some(process_jsonschema_for_gcp_vertex_gemini(output_schema)),
-                    ),
-                    None => (Some(GCPVertexGeminiResponseMimeType::ApplicationJson), None),
+        let (response_mime_type, response_schema, response_json_schema) =
+            match request.json_mode {
+                ModelInferenceRequestJsonMode::On | ModelInferenceRequestJsonMode::Strict => {
+                    match request.output_schema {
+                        Some(output_schema) => {
+                            // Gemini 3 family supports `responseJsonSchema` (full
+                            // JSON Schema). Older models only accept the OpenAPI
+                            // subset under `responseSchema` — strip unsupported
+                            // fields. See `model_supports_response_json_schema`
+                            // for the detection rule.
+                            if model_supports_response_json_schema(model_name) {
+                                (
+                                    Some(GCPVertexGeminiResponseMimeType::ApplicationJson),
+                                    None,
+                                    Some(cleanup_jsonschema_for_response_json_schema(
+                                        output_schema,
+                                    )),
+                                )
+                            } else {
+                                (
+                                    Some(GCPVertexGeminiResponseMimeType::ApplicationJson),
+                                    Some(process_jsonschema_for_gcp_vertex_gemini(output_schema)),
+                                    None,
+                                )
+                            }
+                        }
+                        None => (
+                            Some(GCPVertexGeminiResponseMimeType::ApplicationJson),
+                            None,
+                            None,
+                        ),
+                    }
                 }
-            }
-            ModelInferenceRequestJsonMode::Off => (None, None),
-        };
+                ModelInferenceRequestJsonMode::Off => (None, None, None),
+            };
         let generation_config = Some(GCPVertexGeminiGenerationConfig {
             stop_sequences: request.borrow_stop_sequences(),
             temperature: request.temperature,
@@ -2075,6 +2113,7 @@ impl<'a> GCPVertexGeminiRequest<'a> {
             frequency_penalty: request.frequency_penalty,
             response_mime_type,
             response_schema,
+            response_json_schema,
         });
         // We attach our custom tag so that we can identify the original inference when
         // retrieving batch results.
@@ -2606,6 +2645,47 @@ pub async fn tensorzero_to_gcp_vertex_gemini_content<'a>(
     };
 
     Ok(message)
+}
+
+/// Returns `true` when the model accepts Vertex's full-JSON-Schema
+/// `responseJsonSchema` field (added by Google for Gemini 3+). For older
+/// models we fall back to the legacy OpenAPI-subset `responseSchema`.
+///
+/// The detection is intentionally narrow: only Gemini 3 family. Gemini
+/// 2.5 also supports `responseJsonSchema` in the public API, but our
+/// existing TZ tests + variant configs were all built around the strict
+/// `responseSchema` shape, so widening the rule risks behavior changes
+/// outside this fix's scope.
+pub(crate) fn model_supports_response_json_schema(model_name: &str) -> bool {
+    let lower = model_name.to_lowercase();
+    // gemini-3-flash-preview, gemini-3-pro-preview, gemini-3.1-*, etc.
+    lower.contains("gemini-3")
+}
+
+/// Light-touch cleanup for schemas emitted under `responseJsonSchema`.
+/// Vertex accepts standard JSON Schema here, so we only strip metadata
+/// fields the API explicitly rejects (`$schema`); `additionalProperties`,
+/// `$defs`, and `$ref` are preserved.
+pub(crate) fn cleanup_jsonschema_for_response_json_schema(schema: &Value) -> Value {
+    let mut schema = schema.clone();
+    fn cleanup(value: &mut Value) {
+        match value {
+            Value::Object(obj) => {
+                obj.remove("$schema");
+                for (_, v) in obj.iter_mut() {
+                    cleanup(v);
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr.iter_mut() {
+                    cleanup(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    cleanup(&mut schema);
+    schema
 }
 
 /// Recursively removes fields unsupported by Google's Schema spec
@@ -4605,6 +4685,89 @@ mod tests {
         let processed_schema =
             process_jsonschema_for_gcp_vertex_gemini(&output_schema_with_schema_fields);
         assert_eq!(processed_schema, expected_schema_without_schema_fields);
+    }
+
+    #[test]
+    fn test_model_supports_response_json_schema() {
+        // Gemini 3 family — should use responseJsonSchema
+        assert!(model_supports_response_json_schema("gemini-3-flash-preview"));
+        assert!(model_supports_response_json_schema("gemini-3-pro-preview"));
+        assert!(model_supports_response_json_schema("gemini-3.1-pro-preview"));
+        // Case-insensitive (model_id sometimes ships uppercased in configs)
+        assert!(model_supports_response_json_schema("GEMINI-3-FLASH-PREVIEW"));
+
+        // Older models — should keep the legacy responseSchema path
+        assert!(!model_supports_response_json_schema("gemini-2.5-flash"));
+        assert!(!model_supports_response_json_schema("gemini-2.0-flash"));
+        assert!(!model_supports_response_json_schema("gemini-1.5-pro"));
+        assert!(!model_supports_response_json_schema("claude-3-5-sonnet"));
+    }
+
+    #[test]
+    fn test_cleanup_jsonschema_for_response_json_schema_preserves_additional_properties() {
+        // The whole point of this fix: dict[str, Any] schemas (which Pydantic
+        // emits with `additionalProperties: true`) must keep that field so
+        // Gemini 3 will emit arbitrary keys instead of an empty object.
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "extracted_data": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "description": "Extracted key-value pairs from this location"
+                },
+                "page_number": {"type": "integer"}
+            },
+            "required": ["extracted_data", "page_number"]
+        });
+        let cleaned = cleanup_jsonschema_for_response_json_schema(&schema);
+        // $schema stripped (Vertex rejects metadata fields)
+        assert!(cleaned.get("$schema").is_none());
+        // additionalProperties preserved on inner extracted_data
+        let inner = &cleaned["properties"]["extracted_data"];
+        assert_eq!(inner["additionalProperties"], json!(true));
+        assert_eq!(inner["type"], json!("object"));
+    }
+
+    #[test]
+    fn test_cleanup_jsonschema_for_response_json_schema_preserves_defs_ref() {
+        // PortKey-style schema using $defs/$ref (cleaner than inlined).
+        // Gemini 3's responseJsonSchema accepts standard JSON Schema, so
+        // we don't need to inline like the old responseSchema path.
+        let schema = json!({
+            "$defs": {
+                "PDFPageExtractedData": {
+                    "type": "object",
+                    "properties": {
+                        "extracted_data": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            },
+            "type": "object",
+            "properties": {
+                "extracted_data": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/PDFPageExtractedData"}
+                }
+            }
+        });
+        let cleaned = cleanup_jsonschema_for_response_json_schema(&schema);
+        // $defs and $ref preserved
+        assert!(cleaned.get("$defs").is_some());
+        assert_eq!(
+            cleaned["properties"]["extracted_data"]["items"]["$ref"],
+            json!("#/$defs/PDFPageExtractedData")
+        );
+        // additionalProperties preserved inside $defs
+        assert_eq!(
+            cleaned["$defs"]["PDFPageExtractedData"]["properties"]["extracted_data"]
+                ["additionalProperties"],
+            json!(true)
+        );
     }
 
     #[test]
