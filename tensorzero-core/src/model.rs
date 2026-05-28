@@ -550,6 +550,7 @@ impl ModelConfig {
                                         .tool_config
                                         .clone()
                                         .map(std::borrow::Cow::into_owned),
+                                    finish_reason: response.finish_reason,
                                 },
                             );
                         }
