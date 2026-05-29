@@ -320,16 +320,61 @@ pub trait CacheOutput {
     ) -> impl Future<Output = bool> + Send;
 }
 
+/// Decide whether a response with the given `finish_reason` is safe to
+/// persist to the cache. The rule is conservative: only "natural"
+/// terminal states get cached.
+///
+/// Rationale: cache lookups are keyed by the exact request body hash, so
+/// a cached row is replayed verbatim to every subsequent identical
+/// request. Persisting a row whose stream terminated abnormally turns a
+/// transient upstream failure into a deterministic, sticky failure.
+///
+/// * `Stop` / `StopSequence` — the model finished a complete output on
+///   its own initiative. Safe to replay.
+/// * `ToolCall` — the model returned a function call. Tool-call argument
+///   validity is checked separately in `NonStreamingCacheData`. Safe.
+/// * `Length` — the model hit `max_tokens` mid-content. The output is
+///   truncated — replaying it makes every retry deterministically
+///   incomplete (e.g. unparseable JSON). Skip.
+/// * `ContentFilter` — provider refused the request. The refusal can be
+///   model-version or policy-dependent and isn't a stable inference
+///   result. Skip.
+/// * `Unknown` — provider sent a finish reason we don't recognize
+///   (`FinishReasonUnspecified`, `MalformedFunctionCall` on some
+///   mappings, etc.). Treat as suspect. Skip.
+/// * `None` — the upstream stream terminated without a `finish_reason`
+///   chunk at all (provider-side drop, infra timeout, etc.). This was
+///   the shape of the 2026-05-27 GPT-5 truncation incident at
+///   `inference_id=019e6a71-2e6d-75d3-a66b-5c5056e7969b`. Skip.
+fn finish_reason_is_safe_to_cache(finish_reason: Option<FinishReason>) -> bool {
+    matches!(
+        finish_reason,
+        Some(FinishReason::Stop) | Some(FinishReason::StopSequence) | Some(FinishReason::ToolCall)
+    )
+}
+
 impl CacheOutput for StreamingCacheData {
-    async fn should_write_to_cache(&self, _cache_validation_info: CacheValidationInfo) -> bool {
-        // TODO - getting access to the tool calls would require re-running `collect_chunks`,
-        // or refactoring it to make the parsed content blocks available when performing the cache write.
-        // For now, we'll just always write to the cache.
-        true
+    async fn should_write_to_cache(&self, cache_validation_info: CacheValidationInfo) -> bool {
+        // Skip persisting streams whose finish_reason indicates an
+        // incomplete or transient termination. See
+        // `finish_reason_is_safe_to_cache` for the policy and rationale.
+        //
+        // We intentionally do not re-validate tool-call shape here: the
+        // streaming chunks haven't been collected into parsed
+        // `ContentBlockOutput`s at the point of the cache write. Tool
+        // calls are validated on the non-streaming code path below.
+        finish_reason_is_safe_to_cache(cache_validation_info.finish_reason)
     }
 }
 impl CacheOutput for NonStreamingCacheData {
     async fn should_write_to_cache(&self, cache_validation_info: CacheValidationInfo) -> bool {
+        // First: only persist responses with a clean finish_reason. A
+        // truncated (`Length`) or refused (`ContentFilter`) response, or
+        // one with no finish_reason at all, must not be turned into a
+        // sticky cache hit.
+        if !finish_reason_is_safe_to_cache(cache_validation_info.finish_reason) {
+            return false;
+        }
         for block in &self.blocks {
             if let ContentBlockOutput::ToolCall(tool_call) = block {
                 if cache_validation_info.tool_config.is_some() {
@@ -439,6 +484,11 @@ pub struct CacheValidationInfo {
     // This is deliberately not part of the cache key - we only use it to
     // skip writing certain cache entries.
     pub tool_config: Option<ToolCallConfig>,
+    // The finish_reason for the inference response. Used by
+    // `should_write_to_cache` to skip persisting responses whose stream
+    // terminated abnormally (Length, ContentFilter, Unknown, or none at
+    // all). See `finish_reason_is_safe_to_cache` for the policy.
+    pub finish_reason: Option<FinishReason>,
 }
 
 // This doesn't block
@@ -507,7 +557,10 @@ pub fn start_cache_write_streaming<C: CacheQueries + Clone + 'static>(
             finish_reason,
         },
         cache_manager,
-        CacheValidationInfo { tool_config },
+        CacheValidationInfo {
+            tool_config,
+            finish_reason,
+        },
     );
     Ok(())
 }
@@ -709,5 +762,104 @@ mod tests {
         };
         let streaming_cache_key = model_provider_request.get_cache_key().unwrap();
         assert_ne!(cache_key, streaming_cache_key);
+    }
+
+    // ─── finish_reason_is_safe_to_cache policy ─────────────────────────
+    //
+    // The 2026-05-27 prod incident root cause: TZ persisted a streaming
+    // response whose upstream stream terminated without a finish_reason
+    // chunk. The cached truncated bytes were then replayed to every
+    // subsequent identical request, turning a transient OpenAI stream
+    // drop into a permanent file-extraction failure.
+    //
+    // The tests below pin down the cache-write policy across every
+    // FinishReason variant and across each kind of payload, so a future
+    // change to the policy is forced to be explicit.
+
+    #[tokio::test]
+    async fn streaming_safe_finish_reasons_are_cached() {
+        let data = StreamingCacheData { chunks: vec![] };
+        for fr in [
+            Some(FinishReason::Stop),
+            Some(FinishReason::StopSequence),
+            Some(FinishReason::ToolCall),
+        ] {
+            assert!(
+                data.should_write_to_cache(CacheValidationInfo {
+                    tool_config: None,
+                    finish_reason: fr,
+                })
+                .await,
+                "expected {fr:?} to be cached"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_unsafe_finish_reasons_are_skipped() {
+        let data = StreamingCacheData { chunks: vec![] };
+        for fr in [
+            // The actual prod-incident shape: stream cut off, no chunk
+            // ever delivered a finish_reason.
+            None,
+            // Hit max_tokens mid-content. Caching makes every retry
+            // deterministically truncated.
+            Some(FinishReason::Length),
+            // Provider refused. May be policy-version-dependent.
+            Some(FinishReason::ContentFilter),
+            // Unrecognized native value (e.g. `FinishReasonUnspecified`,
+            // `MalformedFunctionCall`).
+            Some(FinishReason::Unknown),
+        ] {
+            assert!(
+                !data
+                    .should_write_to_cache(CacheValidationInfo {
+                        tool_config: None,
+                        finish_reason: fr,
+                    })
+                    .await,
+                "expected {fr:?} to be skipped"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_streaming_safe_finish_reasons_with_no_tool_call_are_cached() {
+        let data = NonStreamingCacheData { blocks: vec![] };
+        for fr in [
+            Some(FinishReason::Stop),
+            Some(FinishReason::StopSequence),
+            Some(FinishReason::ToolCall),
+        ] {
+            assert!(
+                data.should_write_to_cache(CacheValidationInfo {
+                    tool_config: None,
+                    finish_reason: fr,
+                })
+                .await,
+                "expected {fr:?} to be cached"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_streaming_unsafe_finish_reasons_are_skipped() {
+        let data = NonStreamingCacheData { blocks: vec![] };
+        for fr in [
+            None,
+            Some(FinishReason::Length),
+            Some(FinishReason::ContentFilter),
+            Some(FinishReason::Unknown),
+        ] {
+            assert!(
+                !data
+                    .should_write_to_cache(CacheValidationInfo {
+                        tool_config: None,
+                        finish_reason: fr,
+                    })
+                    .await,
+                "expected {fr:?} to be skipped"
+            );
+        }
     }
 }

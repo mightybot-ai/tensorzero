@@ -224,7 +224,10 @@ impl EmbeddingModelConfig {
                                     output_tokens: response.usage.output_tokens,
                                     finish_reason: None,
                                 },
-                                CacheValidationInfo { tool_config: None },
+                                CacheValidationInfo {
+                                    tool_config: None,
+                                    finish_reason: None,
+                                },
                             );
                         };
                         let embedding_response = EmbeddingModelResponse::new(
