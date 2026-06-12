@@ -56,6 +56,7 @@ use crate::inference::types::{
     ProviderInferenceResponseStreamInner, Role, Text, TextChunk, Thought, ThoughtChunk, Unknown,
     UnknownChunk,
 };
+use crate::inference::types::resolved_input::LazyFile;
 use crate::inference::types::{
     ModelInferenceRequest, ObjectStorageFile, PeekableProviderInferenceResponseStream,
     ProviderInferenceResponse, ProviderInferenceResponseChunk, RequestMessage, Usage,
@@ -1683,6 +1684,12 @@ pub struct GCPVertexInlineData<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct GCPVertexFileData {
+    mime_type: String,
+    file_uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", untagged)]
 pub enum GCPVertexGeminiPartData<'a> {
     Text {
@@ -1692,7 +1699,10 @@ pub enum GCPVertexGeminiPartData<'a> {
         #[serde(rename = "inline_data")]
         inline_data: GCPVertexInlineData<'a>,
     },
-    // TODO (if needed): FileData { file_data: FileData },
+    FileData {
+        #[serde(rename = "file_data")]
+        file_data: GCPVertexFileData,
+    },
     FunctionCall {
         function_call: GCPVertexGeminiFunctionCall<'a>,
     },
@@ -2190,6 +2200,39 @@ fn prepare_tools<'a>(
     }
 }
 
+/// Convert a [`LazyFile`] to a Gemini part.
+///
+/// Vertex AI natively handles `gs://` URIs (all versions) and `https://` URLs
+/// (Gemini 2.5+) via `fileData.fileUri` — no download or base64 encoding needed.
+/// Only `data:` URIs and other schemes fall back to resolve + `inlineData`.
+async fn convert_file_to_gemini_part(file: &LazyFile) -> Result<GCPVertexGeminiPartData<'static>, Error> {
+    if let LazyFile::Url { file_url, .. } = file {
+        let scheme = file_url.url.scheme();
+        if scheme == "gs" || scheme == "https" {
+            let mime_type = match &file_url.mime_type {
+                Some(mt) => mt.to_string(),
+                None => mime_guess::from_path(file_url.url.path())
+                    .first_or_octet_stream()
+                    .to_string(),
+            };
+            return Ok(GCPVertexGeminiPartData::FileData {
+                file_data: GCPVertexFileData {
+                    mime_type,
+                    file_uri: file_url.url.to_string(),
+                },
+            });
+        }
+    }
+    let resolved_file = file.resolve().await?;
+    let ObjectStorageFile { file: meta, data } = &*resolved_file;
+    Ok(GCPVertexGeminiPartData::InlineData {
+        inline_data: GCPVertexInlineData {
+            mime_type: meta.mime_type.to_string(),
+            data: Cow::Owned(data.to_string()),
+        },
+    })
+}
+
 async fn convert_non_thought_content_block<'a>(
     block: Cow<'a, ContentBlock>,
 ) -> Result<FlattenUnknown<'a, GCPVertexGeminiPartData<'a>>, Error> {
@@ -2307,29 +2350,13 @@ async fn convert_non_thought_content_block<'a>(
             ))
         }
         Cow::Borrowed(ContentBlock::File(file)) => {
-            let resolved_file = file.resolve().await?;
-            let ObjectStorageFile { file, data } = &*resolved_file;
-
             Ok(FlattenUnknown::Normal(
-                GCPVertexGeminiPartData::InlineData {
-                    inline_data: GCPVertexInlineData {
-                        mime_type: file.mime_type.to_string(),
-                        data: Cow::Owned(data.to_string()),
-                    },
-                },
+                convert_file_to_gemini_part(file).await?,
             ))
         }
         Cow::Owned(ContentBlock::File(file)) => {
-            let resolved_file = file.resolve().await?;
-            let ObjectStorageFile { file, data } = &*resolved_file;
-
             Ok(FlattenUnknown::Normal(
-                GCPVertexGeminiPartData::InlineData {
-                    inline_data: GCPVertexInlineData {
-                        mime_type: file.mime_type.to_string(),
-                        data: Cow::Owned(data.to_string()),
-                    },
-                },
+                convert_file_to_gemini_part(&file).await?,
             ))
         }
         Cow::Borrowed(ContentBlock::Unknown(Unknown { data, .. })) => {
@@ -2561,33 +2588,21 @@ pub async fn tensorzero_to_gcp_vertex_gemini_content<'a>(
                 });
             }
             Cow::Borrowed(ContentBlock::File(file)) => {
-                let resolved_file = file.resolve().await?;
-                let ObjectStorageFile { file, data } = &*resolved_file;
-
                 model_content_blocks.push(GCPVertexGeminiContentPart {
                     thought: false,
                     thought_signature: None,
-                    data: FlattenUnknown::Normal(GCPVertexGeminiPartData::InlineData {
-                        inline_data: GCPVertexInlineData {
-                            mime_type: file.mime_type.to_string(),
-                            data: Cow::Owned(data.to_string()),
-                        },
-                    }),
+                    data: FlattenUnknown::Normal(
+                        convert_file_to_gemini_part(file).await?,
+                    ),
                 });
             }
             Cow::Owned(ContentBlock::File(file)) => {
-                let resolved_file = file.resolve().await?;
-                let ObjectStorageFile { file, data } = &*resolved_file;
-
                 model_content_blocks.push(GCPVertexGeminiContentPart {
                     thought: false,
                     thought_signature: None,
-                    data: FlattenUnknown::Normal(GCPVertexGeminiPartData::InlineData {
-                        inline_data: GCPVertexInlineData {
-                            mime_type: file.mime_type.to_string(),
-                            data: Cow::Owned(data.to_string()), // Convert to owned String
-                        },
-                    }),
+                    data: FlattenUnknown::Normal(
+                        convert_file_to_gemini_part(&file).await?,
+                    ),
                 });
             }
             Cow::Borrowed(ContentBlock::Thought(thought)) => {
@@ -5948,5 +5963,45 @@ mod tests {
             }
             _ => panic!("Expected a function call part"),
         }
+    }
+
+    #[test]
+    fn test_file_data_serialization() {
+        let part = GCPVertexGeminiPartData::FileData {
+            file_data: GCPVertexFileData {
+                mime_type: "application/pdf".to_string(),
+                file_uri: "gs://my-bucket/path/doc.pdf".to_string(),
+            },
+        };
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "file_data": {
+                    "mime_type": "application/pdf",
+                    "file_uri": "gs://my-bucket/path/doc.pdf"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn test_inline_data_serialization() {
+        let part = GCPVertexGeminiPartData::InlineData {
+            inline_data: GCPVertexInlineData {
+                mime_type: "image/png".to_string(),
+                data: Cow::Borrowed("AAAA"),
+            },
+        };
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "inline_data": {
+                    "mime_type": "image/png",
+                    "data": "AAAA"
+                }
+            })
+        );
     }
 }
