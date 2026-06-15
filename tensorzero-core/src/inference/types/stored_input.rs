@@ -9,7 +9,9 @@ use crate::inference::types::ResolvedInputMessageContent;
 use crate::inference::types::StoredContentBlock;
 use crate::inference::types::System;
 use crate::inference::types::Template;
-use crate::inference::types::file::{Base64FileMetadata, ObjectStorageFile, ObjectStoragePointer};
+use crate::inference::types::file::{
+    Base64FileMetadata, Detail, ObjectStorageFile, ObjectStoragePointer, UrlFile,
+};
 #[cfg(feature = "pyo3")]
 use crate::inference::types::pyo3_helpers::stored_input_message_content_to_python;
 use crate::inference::types::storage::StoragePath;
@@ -22,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::ops::Deref;
 use tensorzero_derive::{TensorZeroDeserialize, export_schema};
+use url::Url;
 
 #[cfg(feature = "pyo3")]
 use crate::inference::types::pyo3_helpers::serialize_to_dict;
@@ -262,6 +265,8 @@ pub enum StoredInputMessageContent {
     #[serde(alias = "image")]
     #[schemars(title = "StoredInputMessageContentFile", with = "ObjectStoragePointer")]
     File(Box<StoredFile>),
+    #[schemars(title = "StoredInputMessageContentExternalFile")]
+    ExternalFile(Box<StoredExternalFile>),
     #[schemars(title = "StoredInputMessageContentUnknown")]
     Unknown(Unknown),
 }
@@ -303,6 +308,14 @@ impl StoredInputMessageContent {
                     },
                 )))
             }
+            StoredInputMessageContent::ExternalFile(file) => {
+                Err(Error::new(crate::error::ErrorDetails::BadFileFetch {
+                    url: file.url.clone(),
+                    message:
+                        "Stored external file cannot be resolved from TensorZero object storage"
+                            .to_string(),
+                }))
+            }
             StoredInputMessageContent::Unknown(unknown) => {
                 Ok(ResolvedInputMessageContent::Unknown(unknown))
             }
@@ -329,9 +342,41 @@ impl StoredInputMessageContent {
                 // This preserves only the metadata without fetching actual file data
                 InputMessageContent::File(File::ObjectStoragePointer(stored_file.0))
             }
+            StoredInputMessageContent::ExternalFile(stored_file) => {
+                InputMessageContent::File(File::Url(UrlFile {
+                    url: stored_file.url,
+                    mime_type: stored_file.mime_type,
+                    detail: stored_file.detail,
+                    filename: stored_file.filename,
+                }))
+            }
             StoredInputMessageContent::Unknown(unknown) => InputMessageContent::Unknown(unknown),
         }
     }
+}
+
+/// A file stored by reference to an external provider-visible URI.
+///
+/// This is used when a provider accepted the URI directly (for example Vertex
+/// `gs://` or Gemini 2.5+ `https://`) and TensorZero never needed to fetch file
+/// bytes. It deliberately does not pretend to be an object-storage pointer.
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, JsonSchema)]
+#[cfg_attr(feature = "ts-bindings", ts(export))]
+#[cfg_attr(feature = "pyo3", pyclass(str))]
+#[export_schema]
+pub struct StoredExternalFile {
+    #[schemars(with = "String")]
+    pub url: Url,
+    #[cfg_attr(feature = "ts-bindings", ts(type = "string | null"))]
+    #[schemars(with = "Option<String>")]
+    pub mime_type: Option<mime::MediaType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub detail: Option<Detail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub filename: Option<String>,
 }
 
 /// A newtype wrapper around `ObjectStoragePointer` that handles legacy deserialization formats.
@@ -428,6 +473,13 @@ impl std::fmt::Display for StoredFile {
     }
 }
 
+impl std::fmt::Display for StoredExternalFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let json = serde_json::to_string_pretty(self).map_err(|_| std::fmt::Error)?;
+        write!(f, "{json}")
+    }
+}
+
 #[cfg(feature = "pyo3")]
 #[pymethods]
 impl StoredFile {
@@ -451,6 +503,26 @@ impl StoredFile {
     #[getter]
     pub fn get_storage_path(&self) -> StoragePath {
         self.0.storage_path.clone()
+    }
+}
+
+#[cfg(feature = "pyo3")]
+#[pymethods]
+impl StoredExternalFile {
+    pub fn __repr__(&self) -> String {
+        self.to_string()
+    }
+
+    #[getter]
+    pub fn url(&self) -> String {
+        self.url.to_string()
+    }
+
+    #[getter]
+    pub fn mime_type_string(&self) -> Option<String> {
+        self.mime_type
+            .as_ref()
+            .map(std::string::ToString::to_string)
     }
 }
 

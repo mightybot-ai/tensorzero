@@ -879,7 +879,10 @@ fn parse_raw_examples(
 
         for messages in &input.messages {
             for content in &messages.content {
-                if let StoredInputMessageContent::File(_) = content {
+                if matches!(
+                    content,
+                    StoredInputMessageContent::File(_) | StoredInputMessageContent::ExternalFile(_)
+                ) {
                     return Err(Error::new(ErrorDetails::Serialization {
                         message: "Failed to deserialize raw_example - images are not supported in dynamic in-context learning".to_string(),
                     }));
@@ -971,7 +974,7 @@ mod tests {
     use crate::inference::types::System;
     use crate::inference::types::file::ObjectStoragePointer;
     use crate::inference::types::resolved_input::LazyResolvedInputMessage;
-    use crate::inference::types::stored_input::StoredFile;
+    use crate::inference::types::stored_input::{StoredExternalFile, StoredFile};
     use crate::minijinja_util::tests::get_test_template_config;
     use crate::tool::ToolChoice;
     use crate::{
@@ -1209,6 +1212,48 @@ mod tests {
         });
         // Parse the raw examples
         let err = parse_raw_examples(raw_examples.clone(), &function)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("images are not supported in dynamic in-context learning"),
+            "Unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_reject_external_file_example() {
+        let raw_examples = vec![RawExample {
+            input: serde_json::to_string(&StoredInput {
+                system: None,
+                messages: vec![StoredInputMessage {
+                    role: Role::User,
+                    content: vec![
+                        StoredInputMessageContent::Text(Text {
+                            text: "What is in this file?".to_string(),
+                        }),
+                        StoredInputMessageContent::ExternalFile(Box::new(StoredExternalFile {
+                            url: "gs://tensorzero-test-bucket/path/to/file.pdf"
+                                .parse()
+                                .unwrap(),
+                            mime_type: Some(mime::APPLICATION_PDF),
+                            detail: None,
+                            filename: Some("file.pdf".to_string()),
+                        })),
+                    ],
+                }],
+            })
+            .unwrap(),
+            output: serde_json::to_string(&vec![ContentBlockChatOutput::Text(Text {
+                text: "A document".to_string(),
+            })])
+            .unwrap(),
+            cosine_distance: 0.1,
+        }];
+
+        let function = FunctionConfig::Chat(FunctionConfigChat {
+            ..Default::default()
+        });
+        let err = parse_raw_examples(raw_examples, &function)
             .unwrap_err()
             .to_string();
         assert!(
