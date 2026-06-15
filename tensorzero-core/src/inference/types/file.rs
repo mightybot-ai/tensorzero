@@ -100,6 +100,18 @@ impl FileExt for File {
                     detail,
                     filename,
                 } = url_file;
+                let scheme = url.scheme();
+                if scheme != "http" && scheme != "https" {
+                    return Err(Error::new(ErrorDetails::BadFileFetch {
+                        url: url.clone(),
+                        message: format!(
+                            "URL scheme '{scheme}' is not supported for file fetching. \
+                             Only http:// and https:// URLs can be downloaded. \
+                             Providers that natively handle this scheme (e.g. gs:// for Vertex AI) \
+                             should bypass file resolution entirely."
+                        ),
+                    }));
+                }
                 let response = client.get(url.clone()).send().await.map_err(|e| {
                     Error::new(ErrorDetails::BadFileFetch {
                         url: url.clone(),
@@ -269,16 +281,23 @@ pub fn sanitize_raw_request(input_messages: &[RequestMessage], mut raw_request: 
                 let file_with_path = match &**file {
                     LazyFile::Url {
                         future,
-                        file_url: _,
+                        file_url,
                     } => {
-                        // If we actually sent the file bytes to some model provider, then the
-                        // Shared future must be ready, so we'll get a file from `now_or_never`.
-                        // Otherwise, the file cannot have been sent to a model provider (since the
-                        // future was never `.await`ed before we constructed `raw_request`), so
-                        // there's nothing to strip from the message.
-                        // We ignore errors here, since an error during file resolution means that
-                        // we cannot have included the file bytes in `raw_request`.
-                        if let Some(Ok(resolved)) = future.clone().now_or_never() {
+                        // Non-HTTP(S) URLs (e.g. gs://) are handled natively by some
+                        // providers (Vertex AI) without downloading, so their bytes are
+                        // never in `raw_request`. Skip `now_or_never` to avoid
+                        // triggering the download future as a side-effect.
+                        let scheme = file_url.url.scheme();
+                        if scheme != "http" && scheme != "https" {
+                            None
+                        } else if let Some(Ok(resolved)) = future.clone().now_or_never() {
+                            // If we actually sent the file bytes to some model provider, then the
+                            // Shared future must be ready, so we'll get a file from `now_or_never`.
+                            // Otherwise, the file cannot have been sent to a model provider (since the
+                            // future was never `.await`ed before we constructed `raw_request`), so
+                            // there's nothing to strip from the message.
+                            // We ignore errors here, since an error during file resolution means that
+                            // we cannot have included the file bytes in `raw_request`.
                             Some(Cow::Owned(File::ObjectStorage(resolved)))
                         } else {
                             None
