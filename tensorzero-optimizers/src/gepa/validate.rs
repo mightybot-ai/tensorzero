@@ -282,7 +282,7 @@ fn validate_stored_input_messages(
         for (content_idx, content_block) in message.content.iter().enumerate() {
             match content_block {
                 // Check for unsupported media types (File includes images/files)
-                StoredInputMessageContent::File(_) => {
+                StoredInputMessageContent::File(_) | StoredInputMessageContent::ExternalFile(_) => {
                     return Err(format!(
                         "stored_input.messages[{msg_idx}].content[{content_idx}] contains File (unsupported media type)"
                     ));
@@ -338,7 +338,7 @@ fn validate_stored_input_messages(
 /// - stored_output is JsonInferenceOutput with parsed is None
 /// - stored_output is ChatInferenceOutput with length 0
 /// - Any message has no content blocks (empty content list)
-/// - Any message contains a File block (StoredInputMessageContent::File(_))
+/// - Any message contains a File or ExternalFile block
 /// - Any Text block has empty text (text.is_empty())
 /// - Any ToolCall block has name as None/empty
 /// - Any Thought block has text, signature, and summary all as None

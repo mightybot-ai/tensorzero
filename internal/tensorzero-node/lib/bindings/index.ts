@@ -329,6 +329,7 @@ export * from "./StorageKind";
 export * from "./StoragePath";
 export * from "./StoredChatInference";
 export * from "./StoredContentBlock";
+export * from "./StoredExternalFile";
 export * from "./StoredFile";
 export * from "./StoredInference";
 export * from "./StoredInput";

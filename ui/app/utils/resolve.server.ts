@@ -192,6 +192,17 @@ async function resolveModelInferenceContent(
     case "thought":
     case "unknown":
       return content;
+    case "external_file":
+      return {
+        type: "unknown",
+        data: {
+          type: content.type,
+          url: content.url,
+          mime_type: content.mime_type,
+          detail: content.detail ?? null,
+          filename: content.filename ?? null,
+        },
+      };
     case "file": {
       const fileContent: ZodFileContent = {
         type: "file",
@@ -471,6 +482,15 @@ async function loadFileDataForStoredInputContent(
         ...loadedFile,
       };
     }
+    case "external_file":
+      return {
+        type: "file",
+        file_type: "url",
+        url: content.url,
+        mime_type: content.mime_type,
+        detail: content.detail,
+        filename: content.filename,
+      };
   }
 }
 
