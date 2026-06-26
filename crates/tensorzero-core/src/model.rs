@@ -963,7 +963,7 @@ impl ModelConfig {
             .await
     }
 
-    #[tracing::instrument(skip_all, fields(model_name = model_name, otel.name = "model_inference", stream = false))]
+    #[tracing::instrument(name = "infer", skip_all, fields(model_name = model_name, otel.name = "model_inference", stream = false))]
     pub(crate) async fn infer_with_request_timeouts<'request>(
         &self,
         request: &'request ModelInferenceRequest<'request>,
@@ -1122,7 +1122,7 @@ impl ModelConfig {
             .await
     }
 
-    #[tracing::instrument(skip_all, fields(model_name = model_name, otel.name = "model_inference", stream = true))]
+    #[tracing::instrument(name = "infer_stream", skip_all, fields(model_name = model_name, otel.name = "model_inference", stream = true))]
     pub(crate) async fn infer_stream_with_request_timeouts<'request>(
         &self,
         request: &'request ModelInferenceRequest<'request>,
