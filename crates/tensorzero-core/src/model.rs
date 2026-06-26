@@ -644,6 +644,81 @@ impl StreamResponse {
 }
 
 impl ModelConfig {
+    fn request_non_streaming_total_timeout(
+        request_timeouts: Option<&TimeoutsConfig>,
+    ) -> Option<Duration> {
+        request_timeouts?
+            .non_streaming
+            .as_ref()?
+            .total_ms
+            .map(Duration::from_millis)
+    }
+
+    fn request_streaming_ttft_timeout(
+        request_timeouts: Option<&TimeoutsConfig>,
+    ) -> Option<Duration> {
+        request_timeouts?
+            .streaming
+            .as_ref()?
+            .ttft_ms
+            .map(Duration::from_millis)
+    }
+
+    fn request_streaming_total_timeout(
+        request_timeouts: Option<&TimeoutsConfig>,
+    ) -> Option<Duration> {
+        request_timeouts?
+            .streaming
+            .as_ref()?
+            .total_ms
+            .map(Duration::from_millis)
+    }
+
+    fn model_non_streaming_total_timeout(&self) -> Option<Duration> {
+        self.timeouts
+            .non_streaming
+            .as_ref()
+            .and_then(|ns| ns.total_ms)
+            .map(Duration::from_millis)
+    }
+
+    fn model_streaming_ttft_timeout(&self) -> Option<Duration> {
+        self.timeouts
+            .streaming
+            .as_ref()
+            .and_then(|s| s.ttft_ms)
+            .map(Duration::from_millis)
+    }
+
+    fn model_streaming_total_timeout(&self) -> Option<Duration> {
+        self.timeouts
+            .streaming
+            .as_ref()
+            .and_then(|s| s.total_ms)
+            .map(Duration::from_millis)
+    }
+
+    fn effective_non_streaming_total_timeout(
+        request_timeouts: Option<&TimeoutsConfig>,
+        configured_timeout: Option<Duration>,
+    ) -> Option<Duration> {
+        Self::request_non_streaming_total_timeout(request_timeouts).or(configured_timeout)
+    }
+
+    fn effective_streaming_ttft_timeout(
+        request_timeouts: Option<&TimeoutsConfig>,
+        configured_timeout: Option<Duration>,
+    ) -> Option<Duration> {
+        Self::request_streaming_ttft_timeout(request_timeouts).or(configured_timeout)
+    }
+
+    fn effective_streaming_total_timeout(
+        request_timeouts: Option<&TimeoutsConfig>,
+        configured_timeout: Option<Duration>,
+    ) -> Option<Duration> {
+        Self::request_streaming_total_timeout(request_timeouts).or(configured_timeout)
+    }
+
     /// Checks if an Unknown content block should be filtered out based on model_name and provider_name.
     /// Returns true if the block should be filtered (removed), false if it should be kept.
     fn should_filter_unknown_block(
@@ -877,13 +952,25 @@ impl ModelConfig {
         })
     }
 
-    #[tracing::instrument(skip_all, fields(model_name = model_name, otel.name = "model_inference", stream = false))]
     pub async fn infer<'request>(
         &self,
         request: &'request ModelInferenceRequest<'request>,
         clients: &InferenceClients,
         model_name: &'request str,
         function_name: Option<&'request str>,
+    ) -> Result<ModelInferenceResponse, Error> {
+        self.infer_with_request_timeouts(request, clients, model_name, function_name, None)
+            .await
+    }
+
+    #[tracing::instrument(skip_all, fields(model_name = model_name, otel.name = "model_inference", stream = false))]
+    pub(crate) async fn infer_with_request_timeouts<'request>(
+        &self,
+        request: &'request ModelInferenceRequest<'request>,
+        clients: &InferenceClients,
+        model_name: &'request str,
+        function_name: Option<&'request str>,
+        request_timeouts: Option<&TimeoutsConfig>,
     ) -> Result<ModelInferenceResponse, Error> {
         let span = tracing::Span::current();
         clients.otlp_config.mark_openinference_chain_span(&span);
@@ -922,7 +1009,10 @@ impl ModelConfig {
 
                 let response_fut =
                     self.non_streaming_provider_request(model_provider_request, provider, clients);
-                let response = if let Some(timeout) = provider.non_streaming_total_timeout() {
+                let response = if let Some(timeout) = Self::effective_non_streaming_total_timeout(
+                    request_timeouts,
+                    provider.non_streaming_total_timeout(),
+                ) {
                     tokio::time::timeout(timeout, response_fut)
                         .await
                         // Convert the outer `Elapsed` error into a TensorZero error,
@@ -1001,13 +1091,10 @@ impl ModelConfig {
         // Some of the providers may themselves have timeouts, which is fine. Provider timeouts
         // are treated as just another kind of provider error - a timeout of N ms is equivalent
         // to a provider taking N ms, and then producing a normal HTTP error.
-        if let Some(timeout) = self
-            .timeouts
-            .non_streaming
-            .as_ref()
-            .and_then(|ns| ns.total_ms)
-        {
-            let timeout = Duration::from_millis(timeout);
+        if let Some(timeout) = Self::effective_non_streaming_total_timeout(
+            request_timeouts,
+            self.model_non_streaming_total_timeout(),
+        ) {
             tokio::time::timeout(timeout, run_all_models)
                 .await
                 // Convert the outer `Elapsed` error into a TensorZero error,
@@ -1024,13 +1111,25 @@ impl ModelConfig {
         }
     }
 
-    #[tracing::instrument(skip_all, fields(model_name = model_name, otel.name = "model_inference", stream = true))]
     pub async fn infer_stream<'request>(
         &self,
         request: &'request ModelInferenceRequest<'request>,
         clients: &InferenceClients,
         model_name: &'request str,
         function_name: Option<&'request str>,
+    ) -> Result<StreamResponseAndMessages, Error> {
+        self.infer_stream_with_request_timeouts(request, clients, model_name, function_name, None)
+            .await
+    }
+
+    #[tracing::instrument(skip_all, fields(model_name = model_name, otel.name = "model_inference", stream = true))]
+    pub(crate) async fn infer_stream_with_request_timeouts<'request>(
+        &self,
+        request: &'request ModelInferenceRequest<'request>,
+        clients: &InferenceClients,
+        model_name: &'request str,
+        function_name: Option<&'request str>,
+        request_timeouts: Option<&TimeoutsConfig>,
     ) -> Result<StreamResponseAndMessages, Error> {
         clients
             .otlp_config
@@ -1083,8 +1182,14 @@ impl ModelConfig {
                 // Compute the effective pre-TTFT deadline from both ttft_ms and total_ms.
                 // If both are set, use the earlier deadline. The error kind reflects which
                 // timeout was responsible.
-                let total_timeout = provider.streaming_total_timeout();
-                let ttft_timeout = provider.streaming_ttft_timeout();
+                let total_timeout = Self::effective_streaming_total_timeout(
+                    request_timeouts,
+                    provider.streaming_total_timeout(),
+                );
+                let ttft_timeout = Self::effective_streaming_ttft_timeout(
+                    request_timeouts,
+                    provider.streaming_ttft_timeout(),
+                );
                 let pre_ttft_timeout = match (ttft_timeout, total_timeout) {
                     (Some(ttft), Some(total)) => {
                         if ttft <= total {
@@ -1155,14 +1260,14 @@ impl ModelConfig {
         let start = tokio::time::Instant::now();
 
         // Compute the effective pre-TTFT deadline from both ttft_ms and total_ms.
-        let ttft_timeout = self
-            .timeouts
-            .streaming
-            .as_ref()
-            .and_then(|s| s.ttft_ms)
-            .map(Duration::from_millis);
-        let streaming_total_ms = self.timeouts.streaming.as_ref().and_then(|s| s.total_ms);
-        let total_timeout = streaming_total_ms.map(Duration::from_millis);
+        let ttft_timeout = Self::effective_streaming_ttft_timeout(
+            request_timeouts,
+            self.model_streaming_ttft_timeout(),
+        );
+        let total_timeout = Self::effective_streaming_total_timeout(
+            request_timeouts,
+            self.model_streaming_total_timeout(),
+        );
         let pre_ttft_timeout = match (ttft_timeout, total_timeout) {
             (Some(ttft), Some(total)) => {
                 if ttft <= total {
@@ -1191,8 +1296,7 @@ impl ModelConfig {
         }?;
 
         // Wrap the post-TTFT stream with the remaining total deadline
-        if let Some(total_ms) = streaming_total_ms {
-            let total_timeout = Duration::from_millis(total_ms);
+        if let Some(total_timeout) = total_timeout {
             let deadline = start + total_timeout;
             let span = result.response.stream.span().clone();
             let inner = result.response.stream.into_inner();
@@ -3724,7 +3828,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::cache::{CacheEnabledMode, CacheManager};
-    use crate::config::with_skip_credential_validation;
+    use crate::config::{NonStreamingTimeouts, StreamingTimeouts, with_skip_credential_validation};
     use crate::rate_limiting::ScopeInfo;
 
     use crate::{
@@ -3747,6 +3851,54 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn test_request_timeouts_override_configured_timeouts() {
+        let configured = Some(Duration::from_millis(60_000));
+        let request_timeouts = TimeoutsConfig {
+            non_streaming: Some(NonStreamingTimeouts {
+                total_ms: Some(400_000),
+            }),
+            streaming: Some(StreamingTimeouts {
+                ttft_ms: Some(150_000),
+                total_ms: Some(400_000),
+            }),
+        };
+
+        assert_eq!(
+            ModelConfig::effective_non_streaming_total_timeout(Some(&request_timeouts), configured),
+            Some(Duration::from_millis(400_000))
+        );
+        assert_eq!(
+            ModelConfig::effective_streaming_ttft_timeout(Some(&request_timeouts), configured),
+            Some(Duration::from_millis(150_000))
+        );
+        assert_eq!(
+            ModelConfig::effective_streaming_total_timeout(Some(&request_timeouts), configured),
+            Some(Duration::from_millis(400_000))
+        );
+
+        let request_timeouts = TimeoutsConfig {
+            non_streaming: None,
+            streaming: Some(StreamingTimeouts {
+                ttft_ms: Some(200_000),
+                total_ms: None,
+            }),
+        };
+
+        assert_eq!(
+            ModelConfig::effective_non_streaming_total_timeout(Some(&request_timeouts), configured),
+            configured
+        );
+        assert_eq!(
+            ModelConfig::effective_streaming_ttft_timeout(Some(&request_timeouts), configured),
+            Some(Duration::from_millis(200_000))
+        );
+        assert_eq!(
+            ModelConfig::effective_streaming_total_timeout(Some(&request_timeouts), configured),
+            configured
+        );
+    }
 
     #[tokio::test]
     async fn test_model_config_infer_routing() {

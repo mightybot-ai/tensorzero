@@ -702,6 +702,7 @@ pub async fn collect_chunks(args: CollectChunksArgs) -> Result<InferenceResult, 
         fetch_and_encode_input_files_before_inference,
         extra_body,
         extra_headers,
+        request_timeouts: None,
         extra_cache_key: None,
     };
     function

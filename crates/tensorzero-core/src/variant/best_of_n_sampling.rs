@@ -1506,6 +1506,7 @@ mod tests {
             fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
 

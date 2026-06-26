@@ -830,6 +830,7 @@ async fn inner_fuse_candidates_stream<'a>(
         clients,
         params,
         *fuser.inner.retries(),
+        inference_config.request_timeouts.clone(),
         Some(&inference_config.function_name),
     )
     .await
@@ -1617,6 +1618,7 @@ mod tests {
             fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
 

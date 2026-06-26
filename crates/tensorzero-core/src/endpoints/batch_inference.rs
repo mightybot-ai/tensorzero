@@ -1173,6 +1173,7 @@ pub async fn write_completed_batch_inference<'a>(
             // Not currently supported as a batch inference parameter
             extra_body,
             extra_headers,
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let inference_params_owned = inference_params.map(Cow::into_owned).unwrap_or_default();

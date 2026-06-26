@@ -27,7 +27,8 @@ use uuid::Uuid;
 use crate::cache::{CacheManager, CacheOptions, CacheParamsOptions};
 use crate::config::snapshot::SnapshotHash;
 use crate::config::{
-    Config, ErrorContext, Namespace, OtlpConfig, SchemaData, UninitializedVariantInfo,
+    Config, ErrorContext, Namespace, OtlpConfig, SchemaData, TimeoutsConfig,
+    UninitializedVariantInfo,
 };
 use crate::cost::{CostConfig, compute_cost_from_streaming_chunks};
 use crate::db::clickhouse::ClickHouseConnectionInfo;
@@ -104,6 +105,9 @@ pub struct Params {
     // Inference-time overrides for variant types (use with caution)
     #[serde(default)]
     pub params: InferenceParams,
+    // Request-level timeout overrides for this inference only.
+    #[serde(default)]
+    pub timeouts: Option<TimeoutsConfig>,
     // if the client would like to pin a specific variant to be used
     // NOTE: YOU SHOULD TYPICALLY LET THE API SELECT A VARIANT FOR YOU (I.E. IGNORE THIS FIELD).
     //       ONLY PIN A VARIANT FOR SPECIAL USE CASES (E.G. TESTING / DEBUGGING VARIANTS).
@@ -365,6 +369,9 @@ pub async fn inference(
     let inference_id = Uuid::now_v7();
     span.record("inference_id", inference_id.to_string());
     validate_tags(&params.tags, params.internal)?;
+    if let Some(timeouts) = &params.timeouts {
+        timeouts.validate(&config.gateway.global_outbound_http_timeout)?;
+    }
 
     // Retrieve or generate the episode ID
     let episode_id = params.episode_id.unwrap_or_else(Uuid::now_v7);
@@ -542,6 +549,7 @@ pub async fn inference(
             inference_models,
             inference_clients,
             inference_params: params.params.clone(),
+            request_timeouts: params.timeouts.clone(),
             templates,
             tool_config: &tool_config,
             output_schema: &output_schema,
@@ -604,6 +612,7 @@ pub async fn inference(
             inference_models: inference_models.clone(),
             inference_clients: inference_clients.clone(),
             inference_params: params.params.clone(),
+            request_timeouts: params.timeouts.clone(),
             templates,
             tool_config: &tool_config,
             output_schema: &output_schema,
@@ -767,6 +776,7 @@ struct InferVariantArgs<'a> {
     inference_models: InferenceModels,
     inference_clients: InferenceClients,
     inference_params: InferenceParams,
+    request_timeouts: Option<TimeoutsConfig>,
     templates: &'a Arc<TemplateConfig<'static>>,
     tool_config: &'a Option<ToolCallConfig>,
     output_schema: &'a Option<JSONSchema>,
@@ -798,6 +808,7 @@ async fn infer_variant(args: InferVariantArgs<'_>) -> Result<InferenceOutput, Er
         inference_models,
         inference_clients,
         inference_params,
+        request_timeouts,
         templates,
         tool_config,
         output_schema,
@@ -834,6 +845,7 @@ async fn infer_variant(args: InferVariantArgs<'_>) -> Result<InferenceOutput, Er
         extra_cache_key: None,
         extra_body: extra_body.clone(),
         extra_headers: extra_headers.clone(),
+        request_timeouts,
     });
 
     if stream {
