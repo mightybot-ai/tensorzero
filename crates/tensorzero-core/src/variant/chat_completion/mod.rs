@@ -636,6 +636,7 @@ impl Variant for ChatCompletionConfig {
             clients,
             inference_params,
             self.retries,
+            inference_config.request_timeouts.clone(),
             Some(&inference_config.function_name),
         )
         .await
@@ -1471,6 +1472,7 @@ mod tests {
             fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let models = ModelTable::default();
@@ -1536,6 +1538,7 @@ mod tests {
             },
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let result = chat_completion_config
@@ -1613,6 +1616,7 @@ mod tests {
             },
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let err = chat_completion_config
@@ -1718,6 +1722,7 @@ mod tests {
             },
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let result = chat_completion_config
@@ -1805,6 +1810,7 @@ mod tests {
             },
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let result = chat_completion_config
@@ -1906,6 +1912,7 @@ mod tests {
             },
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let inference_params = InferenceParams::default();
@@ -1989,6 +1996,7 @@ mod tests {
             fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let chat_completion_config = UninitializedChatCompletionConfig {
@@ -2125,6 +2133,7 @@ mod tests {
             fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let chat_completion_config = UninitializedChatCompletionConfig {
@@ -2249,6 +2258,7 @@ mod tests {
             fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let chat_completion_config = UninitializedChatCompletionConfig {
@@ -2518,6 +2528,7 @@ mod tests {
             fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let result = chat_completion_config
@@ -2600,6 +2611,7 @@ mod tests {
             fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let (mut stream, models_used) = chat_completion_config
@@ -2709,6 +2721,7 @@ mod tests {
             fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let inference_config_arc = Arc::new(inference_config);
@@ -2816,6 +2829,7 @@ mod tests {
             fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let inference_config_arc = Arc::new(inference_config);
@@ -2900,6 +2914,7 @@ mod tests {
             fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let inference_config_arc = Arc::new(inference_config);

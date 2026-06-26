@@ -14,7 +14,7 @@ use tensorzero_derive::TensorZeroDeserialize;
 use uuid::Uuid;
 
 use crate::cache::CacheParamsOptions;
-use crate::config::{Namespace, UninitializedVariantInfo};
+use crate::config::{Namespace, TimeoutsConfig, UninitializedVariantInfo};
 use crate::endpoints::inference::{
     ChatCompletionInferenceParams, InferenceCredentials, InferenceParams, InferenceResponse, Params,
 };
@@ -157,6 +157,8 @@ pub struct OpenAICompatibleParams {
     pub tensorzero_provider_tools: Vec<ProviderTool>,
     #[serde(default, rename = "tensorzero::params")]
     pub tensorzero_params: Option<InferenceParams>,
+    #[serde(default, rename = "tensorzero::timeouts")]
+    pub tensorzero_timeouts: Option<TimeoutsConfig>,
     #[serde(default, rename = "tensorzero::include_raw_usage")]
     pub tensorzero_include_raw_usage: bool,
     /// DEPRECATED (#5697 / 2026.4+): Use `tensorzero::include_raw_response` instead.
@@ -488,6 +490,7 @@ impl Params {
             input,
             stream: openai_compatible_params.stream,
             params: inference_params,
+            timeouts: openai_compatible_params.tensorzero_timeouts,
             variant_name: openai_compatible_params.tensorzero_variant_name,
             dryrun: openai_compatible_params.tensorzero_dryrun,
             dynamic_tool_params,
@@ -960,6 +963,36 @@ mod tests {
         assert_eq!(params.params.chat_completion.presence_penalty, Some(0.5));
         assert_eq!(params.params.chat_completion.frequency_penalty, Some(0.5));
         assert_eq!(params.tags, tensorzero_tags);
+    }
+
+    #[test]
+    fn test_openai_compatible_request_timeouts() {
+        let params: OpenAICompatibleParams = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "Hello, world!"}],
+            "model": "tensorzero::function_name::test_function",
+            "tensorzero::timeouts": {
+                "non_streaming": {"total_ms": 400000},
+                "streaming": {"ttft_ms": 400000, "total_ms": 400000}
+            },
+        }))
+        .expect("OpenAI-compatible params should deserialize");
+
+        let params = Params::try_from_openai(params).expect("params should convert");
+        let timeouts = params
+            .timeouts
+            .expect("request timeouts should be preserved");
+
+        assert_eq!(
+            timeouts
+                .non_streaming
+                .and_then(|timeouts| timeouts.total_ms),
+            Some(400000)
+        );
+        let streaming = timeouts
+            .streaming
+            .expect("streaming timeouts should be preserved");
+        assert_eq!(streaming.ttft_ms, Some(400000));
+        assert_eq!(streaming.total_ms, Some(400000));
     }
 
     #[test]
