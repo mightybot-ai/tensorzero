@@ -512,6 +512,7 @@ impl MixtureOfNConfig {
                 // However, the 'A, C' and 'C, D' evaluations will all have distinct cache keys:
                 // (A, 2), (C, 3), (C, 2), (D, 4)
                 let config = InferenceConfig {
+                    request_timeouts: None,
                     variant_name: Arc::from(candidate.as_str()),
                     extra_cache_key: Some(format!("candidate_{i}")),
                     ..inference_config.as_ref().clone()
@@ -762,6 +763,7 @@ async fn inner_fuse_candidates_stream<'a>(
         clients,
         params,
         *fuser.inner.retries(),
+        inference_config.request_timeouts.clone(),
     )
     .await
 }
@@ -1513,6 +1515,7 @@ mod tests {
             messages: vec![],
         };
         let inference_config = InferenceConfig {
+            request_timeouts: None,
             ids: InferenceIds {
                 inference_id: Uuid::now_v7(),
                 episode_id: Uuid::now_v7(),

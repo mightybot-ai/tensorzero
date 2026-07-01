@@ -141,6 +141,8 @@ pub struct InferenceConfig {
     pub ids: InferenceIds,
     pub extra_body: UnfilteredInferenceExtraBody,
     pub extra_headers: UnfilteredInferenceExtraHeaders,
+    /// Request-level timeout overrides for this inference only.
+    pub request_timeouts: Option<TimeoutsConfig>,
     pub fetch_and_encode_input_files_before_inference: bool,
     /// Optional arbitrary data, only used when constructing the cache key.
     /// This is used by best_of_n/mixture_of_n to force different sub-variants
@@ -187,6 +189,7 @@ impl BatchInferenceConfig {
                 // Not yet supported for batch inference requests
                 extra_body: Default::default(),
                 extra_headers: Default::default(),
+                request_timeouts: None,
                 extra_cache_key: None,
             },
         )
@@ -815,7 +818,12 @@ async fn infer_model_request(
         .retry_config
         .retry_collecting_errors(|| async {
             args.model_config
-                .infer(&args.request, &clients, &args.model_name)
+                .infer_with_request_timeouts(
+                    &args.request,
+                    &clients,
+                    &args.model_name,
+                    args.inference_config.request_timeouts.as_ref(),
+                )
                 .await
         })
         .await;
@@ -876,12 +884,18 @@ async fn infer_model_request_stream<'request>(
     clients: InferenceClients,
     inference_params: InferenceParams,
     retry_config: RetryConfig,
+    request_timeouts: Option<TimeoutsConfig>,
 ) -> Result<(InferenceResultStream, ModelUsedInfo), Error> {
     let include_raw_response = clients.include_raw_response;
     let (result, retry_errors) = retry_config
         .retry_collecting_errors(|| async {
             model_config
-                .infer_stream(&request, &clients, &model_name)
+                .infer_stream_with_request_timeouts(
+                    &request,
+                    &clients,
+                    &model_name,
+                    request_timeouts.as_ref(),
+                )
                 .await
         })
         .await;
@@ -1069,6 +1083,7 @@ mod tests {
             fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
 
@@ -1210,6 +1225,7 @@ mod tests {
             fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
         let json_mode = JsonMode::Tool;
@@ -1319,6 +1335,7 @@ mod tests {
             fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
 
@@ -1635,6 +1652,7 @@ mod tests {
             fetch_and_encode_input_files_before_inference: false,
             extra_body: Default::default(),
             extra_headers: Default::default(),
+            request_timeouts: None,
             extra_cache_key: None,
         };
 
@@ -1871,6 +1889,7 @@ mod tests {
             clients.clone(),
             inference_params.clone(),
             retry_config,
+            None,
         )
         .await;
 
@@ -2051,6 +2070,7 @@ mod tests {
             clients.clone(),
             inference_params.clone(),
             retry_config,
+            None,
         )
         .await;
 

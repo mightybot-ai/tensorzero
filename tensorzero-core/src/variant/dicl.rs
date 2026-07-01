@@ -359,6 +359,7 @@ impl Variant for DiclConfig {
             clients,
             inference_params,
             *self.retries(),
+            inference_config.request_timeouts.clone(),
         )
         .await?;
 
@@ -1501,6 +1502,7 @@ mod tests {
         // Setup inference config
         let templates = get_test_template_config().await;
         let inference_config = InferenceConfig {
+            request_timeouts: None,
             templates: Arc::new(templates),
             tool_config: None,
             function_name: "test_function".into(),
@@ -1631,6 +1633,7 @@ mod tests {
         // Setup inference config
         let templates = get_test_template_config().await;
         let inference_config = InferenceConfig {
+            request_timeouts: None,
             templates: Arc::new(templates),
             tool_config: None,
             function_name: "test_function".into(),

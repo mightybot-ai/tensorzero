@@ -1949,6 +1949,7 @@ mod tests {
         };
         let templates = Arc::new(TemplateConfig::default());
         let inference_config = InferenceConfig {
+            request_timeouts: None,
             ids: InferenceIds {
                 inference_id: Uuid::now_v7(),
                 episode_id: Uuid::now_v7(),
@@ -2276,6 +2277,7 @@ mod tests {
             "required": ["answer"]
         }));
         let inference_config = InferenceConfig {
+            request_timeouts: None,
             ids: InferenceIds {
                 inference_id: Uuid::now_v7(),
                 episode_id: Uuid::now_v7(),
