@@ -41,6 +41,8 @@ echo "Starting background ClickHouse wake-up..."
 curl --retry 20 --retry-delay 5 --retry-max-time 300 --retry-all-errors --max-time 15 \
     "$TENSORZERO_CLICKHOUSE_URL" --data-binary 'SELECT 1' > /dev/null 2>&1 &
 
+REPO_ROOT="$(pwd)"
+
 # Set up cleanup function to run on exit
 cleanup_database() {
     if [ -n "${TENSORZERO_CLICKHOUSE_URL:-}" ]; then
@@ -57,8 +59,8 @@ cleanup_database() {
             echo "Cleanup completed for database: $DB_NAME"
         fi
     fi
-    docker compose -f tensorzero-core/tests/e2e/docker-compose.yml down -v || true
-    cat e2e_logs.txt || echo "e2e logs don't exist"
+    docker compose -f "$REPO_ROOT/crates/tensorzero-core/tests/e2e/docker-compose.yml" down -v || true
+    cat "$REPO_ROOT/crates/e2e_logs.txt" || echo "e2e logs don't exist"
 }
 
 # Register cleanup function to run on script exit (success or failure)
@@ -82,7 +84,13 @@ ARCH=$(dpkg --print-architecture)
 echo "deb https://packages.clickhouse.com/deb stable main" | sudo tee /etc/apt/sources.list.d/clickhouse.list
 # Update apt package lists
 sudo apt-get update
-sudo apt-get install -y clickhouse-client
+# Pin to 26.4.3.37: 26.5.1.882 forces the ParquetV3 reader for `INSERT FROM INFILE`
+# and rejects our committed `large_*.parquet` fixtures with `Code: 117 (INCORRECT_DATA)`,
+# ignoring `input_format_parquet_use_native_reader_v3=0`.
+CLICKHOUSE_CLIENT_VERSION=26.4.3.37
+sudo apt-get install -y \
+    "clickhouse-client=${CLICKHOUSE_CLIENT_VERSION}" \
+    "clickhouse-common-static=${CLICKHOUSE_CLIENT_VERSION}"
 
 curl \
     --retry 20 --retry-delay 5 --retry-max-time 300 --retry-all-errors --max-time 15 \
@@ -92,16 +100,28 @@ curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-delay 5 --retry-all-error
 curl -LsSf --retry 3 --retry-delay 5 --retry-all-errors https://astral.sh/uv/0.9.27/install.sh | sh
 source $HOME/.local/bin/env
 curl -LsSf --retry 3 --retry-delay 5 --retry-all-errors https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+# Install s5cmd for authenticated fixture downloads from R2
+ARCH=$(uname -m)
+if [ "$ARCH" = "x86_64" ]; then
+    S5CMD_ARCH="64bit"
+elif [ "$ARCH" = "aarch64" ]; then
+    S5CMD_ARCH="arm64"
+else
+    echo "Unsupported architecture: $ARCH" && exit 1
+fi
+curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-${S5CMD_ARCH}.tar.gz" \
+    | tar xz -C /usr/local/bin s5cmd
 uv run ./ui/fixtures/download-large-fixtures.py
 uv run ./ui/fixtures/download-small-fixtures.py
 ./ci/delete-clickhouse-dbs.sh
 
 # Start postgres service for migrations
 # `cargo test-clickhouse` should not include any Postgres tests, but we're including it here to be safe.
-docker compose -f tensorzero-core/tests/e2e/docker-compose.yml up -d --wait postgres
+docker compose -f crates/tensorzero-core/tests/e2e/docker-compose.yml up -d --wait postgres
 export TENSORZERO_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/tensorzero-e2e-tests
 export DATABASE_URL=postgres://postgres:postgres@localhost:5432/tensorzero-e2e-tests
 
+cd crates
 SQLX_OFFLINE=1 cargo build-e2e
 cargo run --bin gateway --features e2e_tests -- --run-postgres-migrations
 
@@ -125,10 +145,11 @@ echo "Starting background test compilation..."
 SQLX_OFFLINE=1 cargo test-clickhouse --no-run &
 TEST_BUILD_PID=$!
 
-export CLICKHOUSE_USER="$CLICKHOUSE_USERNAME"
-export CLICKHOUSE_PASSWORD="$CLICKHOUSE_PASSWORD"
+export CLICKHOUSE_USER=$(buildkite-agent secret get CLICKHOUSE_CLOUD_INSERT_USERNAME)
+export CLICKHOUSE_PASSWORD=$(buildkite-agent secret get CLICKHOUSE_CLOUD_INSERT_PASSWORD)
+export CLICKHOUSE_SECURE=1
 export SQLX_OFFLINE=1
-cd ui/fixtures
+cd ../ui/fixtures
 max_retries=3
 for attempt in $(seq 1 $max_retries); do
     if ./load_fixtures.sh $DATABASE_NAME; then
@@ -141,7 +162,7 @@ for attempt in $(seq 1 $max_retries); do
     echo "load_fixtures.sh failed (attempt $attempt/$max_retries), retrying..."
     sleep 5
 done
-cd ../..
+cd ../../crates
 sleep 2
 
 # Wait for background test compilation to finish
