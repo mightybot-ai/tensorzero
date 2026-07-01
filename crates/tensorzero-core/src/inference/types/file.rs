@@ -83,6 +83,18 @@ impl FileExt for File {
                     detail,
                     filename,
                 } = url_file;
+                let scheme = url.scheme();
+                if scheme != "http" && scheme != "https" {
+                    return Err(Error::new(ErrorDetails::BadFileFetch {
+                        url: url.clone(),
+                        message: format!(
+                            "URL scheme '{scheme}' is not supported for file fetching. \
+                             Only http:// and https:// URLs can be downloaded. \
+                             Providers that natively handle this scheme (e.g. gs:// for Vertex AI) \
+                             should bypass file resolution entirely."
+                        ),
+                    }));
+                }
                 let response = client.get(url.clone()).send().await.map_err(|e| {
                     Error::new(ErrorDetails::BadFileFetch {
                         url: url.clone(),

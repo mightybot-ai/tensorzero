@@ -28,12 +28,12 @@
 //! * `StoredInput/StoredInputMessage/StoredInputMessageContent`:
 //!
 //!  These types represent the actual data written to `ChatInference`/`JsonInference` in ClickHouse.
-//!  Files are stored as object store paths, without the actual file contents (since we only write paths to ClickHouse)
+//!  Files are stored as object store paths or external URIs, without the actual file contents.
 //!  Templating has been applied.
 //! * `StoredRequestMessage/StoredContentBlock`:
 //!
 //!  These types represent the actual data written to `ModelInference` in ClickHouse.
-//!  Files are stored as object store paths, without the actual file contents (since we only write paths to ClickHouse)
+//!  Files are stored as object store paths or external URIs, without the actual file contents.
 //!  Templating has been applied.
 //!
 //! During normal inference processing, the types are transformed as:
@@ -89,7 +89,7 @@ use crate::inference::types::resolved_input::{
     LazyResolvedInput, LazyResolvedInputMessage, LazyResolvedInputMessageContent, write_file,
 };
 use crate::inference::types::storage::{StorageKind, StorageKindExt};
-use crate::inference::types::stored_input::StoredFile;
+use crate::inference::types::stored_input::{StoredExternalFile, StoredFile};
 use crate::inference::types::usage::aggregate_usage_across_model_inferences;
 use crate::rate_limiting::{
     EstimatedRateLimitResourceUsage, RateLimitResource, RateLimitResourceUsage,
@@ -227,6 +227,25 @@ impl LazyResolvedInput {
             messages: stored_messages,
         })
     }
+
+    /// Turns the input into a StoredInput for observability writes without
+    /// starting URI fetches solely for persistence.
+    pub async fn into_observability_stored_input(
+        self,
+        object_store_info: &Option<ObjectStoreInfo>,
+    ) -> StoredInput {
+        let stored_messages = join_all(
+            self.messages
+                .into_iter()
+                .map(|message| message.into_observability_stored_input_message(object_store_info)),
+        )
+        .await;
+
+        StoredInput {
+            system: self.system,
+            messages: stored_messages,
+        }
+    }
 }
 
 /// Extension trait for `InputMessage` that provides core-specific transformation methods.
@@ -299,6 +318,21 @@ impl LazyResolvedInputMessage {
             role: self.role,
             content,
         })
+    }
+
+    pub async fn into_observability_stored_input_message(
+        self,
+        object_store_info: &Option<ObjectStoreInfo>,
+    ) -> StoredInputMessage {
+        let content = join_all(self.content.into_iter().map(|content| {
+            content.into_observability_stored_input_message_content(object_store_info)
+        }))
+        .await;
+
+        StoredInputMessage {
+            role: self.role,
+            content,
+        }
     }
 }
 
@@ -694,6 +728,127 @@ impl LazyResolvedInputMessageContent {
             other => other.resolve().await?.into_stored_input_message_content(),
         })
     }
+
+    pub async fn into_observability_stored_input_message_content(
+        self,
+        object_store_info: &Option<ObjectStoreInfo>,
+    ) -> StoredInputMessageContent {
+        match self {
+            LazyResolvedInputMessageContent::File(file) => {
+                match lazy_file_to_observability_stored_reference(*file, object_store_info).await {
+                    StoredFileReference::ObjectStorage(file) => {
+                        StoredInputMessageContent::File(Box::new(file))
+                    }
+                    StoredFileReference::External(file) => {
+                        StoredInputMessageContent::ExternalFile(Box::new(file))
+                    }
+                }
+            }
+            LazyResolvedInputMessageContent::Text(text) => StoredInputMessageContent::Text(text),
+            LazyResolvedInputMessageContent::Template(template) => {
+                StoredInputMessageContent::Template(template)
+            }
+            LazyResolvedInputMessageContent::ToolCall(tool_call) => {
+                StoredInputMessageContent::ToolCall(tool_call)
+            }
+            LazyResolvedInputMessageContent::ToolResult(tool_result) => {
+                StoredInputMessageContent::ToolResult(tool_result)
+            }
+            LazyResolvedInputMessageContent::RawText(raw_text) => {
+                StoredInputMessageContent::RawText(raw_text)
+            }
+            LazyResolvedInputMessageContent::Thought(thought) => {
+                StoredInputMessageContent::Thought(thought)
+            }
+            LazyResolvedInputMessageContent::Unknown(unknown) => {
+                StoredInputMessageContent::Unknown(unknown)
+            }
+        }
+    }
+}
+
+enum StoredFileReference {
+    ObjectStorage(StoredFile),
+    External(StoredExternalFile),
+}
+
+fn stored_external_file_from_url(file_url: FileUrl) -> StoredExternalFile {
+    StoredExternalFile {
+        url: file_url.url,
+        mime_type: file_url.mime_type,
+        detail: file_url.detail,
+        filename: file_url.filename,
+    }
+}
+
+async fn write_resolved_file_best_effort(
+    object_store_info: &Option<ObjectStoreInfo>,
+    resolved_file: &ObjectStorageFile,
+) {
+    let base64_file = match Base64File::new(
+        resolved_file.file.source_url.clone(),
+        Some(resolved_file.file.mime_type.clone()),
+        resolved_file.data.clone(),
+        resolved_file.file.detail.clone(),
+        resolved_file.file.filename.clone(),
+    ) {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::error!("Failed to create Base64File from ObjectStorageFile: {e:?}");
+            return;
+        }
+    };
+
+    if let Err(e) = write_file(
+        object_store_info,
+        base64_file,
+        resolved_file.file.storage_path.clone(),
+    )
+    .await
+    {
+        tracing::error!("Failed to write file to object store: {e:?}");
+    }
+}
+
+fn stored_reference_from_lazy_file_without_fetch(file: LazyFile) -> StoredFileReference {
+    match file {
+        LazyFile::ObjectStoragePointer {
+            metadata,
+            storage_path,
+            future: _,
+        } => StoredFileReference::ObjectStorage(StoredFile(ObjectStoragePointer {
+            source_url: metadata.source_url,
+            mime_type: metadata.mime_type,
+            storage_path,
+            detail: metadata.detail,
+            filename: metadata.filename,
+        })),
+        LazyFile::ObjectStorage(resolved) => {
+            StoredFileReference::ObjectStorage(StoredFile(resolved.file))
+        }
+        LazyFile::Base64(pending) => StoredFileReference::ObjectStorage(StoredFile(pending.0.file)),
+        LazyFile::Url {
+            file_url,
+            future: _,
+        } => StoredFileReference::External(stored_external_file_from_url(file_url)),
+    }
+}
+
+async fn lazy_file_to_observability_stored_reference(
+    file: LazyFile,
+    object_store_info: &Option<ObjectStoreInfo>,
+) -> StoredFileReference {
+    match file {
+        LazyFile::Base64(pending) => {
+            write_resolved_file_best_effort(object_store_info, &pending.0).await;
+            StoredFileReference::ObjectStorage(StoredFile(pending.0.file))
+        }
+        LazyFile::Url {
+            file_url,
+            future: _,
+        } => StoredFileReference::External(stored_external_file_from_url(file_url)),
+        other => stored_reference_from_lazy_file_without_fetch(other),
+    }
 }
 
 impl From<StoredInputMessage> for InputMessage {
@@ -817,10 +972,14 @@ impl ContentBlockExt for ContentBlock {
                 Ok(StoredContentBlock::ToolResult(tool_result))
             }
             ContentBlock::File(file) => {
-                let resolved_file = file.resolve().await?.clone().into_owned();
-                Ok(StoredContentBlock::File(Box::new(
-                    File::ObjectStorage(resolved_file).into_stored_file()?,
-                )))
+                Ok(match stored_reference_from_lazy_file_without_fetch(*file) {
+                    StoredFileReference::ObjectStorage(file) => {
+                        StoredContentBlock::File(Box::new(file))
+                    }
+                    StoredFileReference::External(file) => {
+                        StoredContentBlock::ExternalFile(Box::new(file))
+                    }
+                })
             }
             ContentBlock::Thought(thought) => Ok(StoredContentBlock::Thought(thought)),
             ContentBlock::Unknown(unknown) => Ok(StoredContentBlock::Unknown(unknown)),
@@ -875,6 +1034,7 @@ pub enum StoredContentBlock {
     ToolResult(ToolResult),
     #[serde(alias = "image")]
     File(Box<StoredFile>),
+    ExternalFile(Box<StoredExternalFile>),
     Thought(Thought),
     Unknown(Unknown),
 }
@@ -1880,7 +2040,10 @@ mod tests {
     use crate::jsonschema_util::JSONSchema;
     use crate::providers::test_helpers::get_temperature_tool_config;
     use crate::tool::{DynamicToolConfig, FunctionToolConfig, ToolChoice};
+    use futures::FutureExt;
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
 
     #[test]
     fn test_rate_limited_input_message_content_estimation() {
@@ -3155,6 +3318,92 @@ mod tests {
             get_finish_reason(&results_empty),
             None,
             "Empty slice should return None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_observability_stored_input_preserves_unresolved_url_file() {
+        let url: url::Url = "gs://tensorzero-test-bucket/path/to/file.pdf"
+            .parse()
+            .unwrap();
+        let future_polled = Arc::new(AtomicBool::new(false));
+        let future_polled_for_future = Arc::clone(&future_polled);
+        let input = LazyResolvedInput {
+            system: None,
+            messages: vec![LazyResolvedInputMessage {
+                role: Role::User,
+                content: vec![LazyResolvedInputMessageContent::File(Box::new(
+                    LazyFile::Url {
+                        file_url: FileUrl {
+                            url: url.clone(),
+                            mime_type: Some(mime::APPLICATION_PDF),
+                            detail: None,
+                            filename: Some("file.pdf".to_string()),
+                        },
+                        future: futures::future::poll_fn(move |_| {
+                            future_polled_for_future.store(true, Ordering::SeqCst);
+                            Poll::Pending
+                        })
+                        .boxed()
+                        .shared(),
+                    },
+                ))],
+            }],
+        };
+
+        let stored = input.into_observability_stored_input(&None).await;
+
+        match &stored.messages[0].content[0] {
+            StoredInputMessageContent::ExternalFile(file) => {
+                assert_eq!(file.url, url);
+                assert_eq!(file.mime_type, Some(mime::APPLICATION_PDF));
+                assert_eq!(file.filename.as_deref(), Some("file.pdf"));
+            }
+            other => panic!("expected external file, got {other:?}"),
+        }
+        assert!(
+            !future_polled.load(Ordering::SeqCst),
+            "observability storage should not poll URL fetch future"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stored_request_message_preserves_unresolved_url_file() {
+        let url: url::Url = "gs://tensorzero-test-bucket/path/to/file.pdf"
+            .parse()
+            .unwrap();
+        let future_polled = Arc::new(AtomicBool::new(false));
+        let future_polled_for_future = Arc::clone(&future_polled);
+        let message = RequestMessage {
+            role: Role::User,
+            content: vec![ContentBlock::File(Box::new(LazyFile::Url {
+                file_url: FileUrl {
+                    url: url.clone(),
+                    mime_type: Some(mime::APPLICATION_PDF),
+                    detail: None,
+                    filename: None,
+                },
+                future: futures::future::poll_fn(move |_| {
+                    future_polled_for_future.store(true, Ordering::SeqCst);
+                    Poll::Pending
+                })
+                .boxed()
+                .shared(),
+            }))],
+        };
+
+        let stored = message.into_stored_message().await.unwrap();
+
+        match &stored.content[0] {
+            StoredContentBlock::ExternalFile(file) => {
+                assert_eq!(file.url, url);
+                assert_eq!(file.mime_type, Some(mime::APPLICATION_PDF));
+            }
+            other => panic!("expected external file, got {other:?}"),
+        }
+        assert!(
+            !future_polled.load(Ordering::SeqCst),
+            "model storage should not poll URL fetch future"
         );
     }
 }

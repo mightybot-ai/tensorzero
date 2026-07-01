@@ -44,6 +44,7 @@ use crate::inference::types::batch::{
 use crate::inference::types::chat_completion_inference_params::{
     ChatCompletionInferenceParamsV2, warn_inference_parameter_not_supported,
 };
+use crate::inference::types::resolved_input::LazyFile;
 use crate::inference::types::resolved_input::LazyFileExt;
 use crate::inference::types::usage::raw_usage_entries_from_value;
 use crate::inference::types::{
@@ -1674,6 +1675,12 @@ pub struct GCPVertexInlineData<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct GCPVertexFileData {
+    mime_type: String,
+    file_uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", untagged)]
 pub enum GCPVertexGeminiPartData<'a> {
     Text {
@@ -1683,7 +1690,10 @@ pub enum GCPVertexGeminiPartData<'a> {
         #[serde(rename = "inline_data")]
         inline_data: GCPVertexInlineData<'a>,
     },
-    // TODO (if needed): FileData { file_data: FileData },
+    FileData {
+        #[serde(rename = "file_data")]
+        file_data: GCPVertexFileData,
+    },
     FunctionCall {
         function_call: GCPVertexGeminiFunctionCall<'a>,
     },
@@ -1937,8 +1947,22 @@ pub(super) struct GCPVertexGeminiGenerationConfig<'a> {
     seed: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_mime_type: Option<GCPVertexGeminiResponseMimeType>,
+    /// OpenAPI-3.0 subset schema. Used for Gemini < 3. Vertex rejects
+    /// fields like `additionalProperties` / `$defs` here, so we strip
+    /// them via `process_jsonschema_for_gcp_vertex_gemini`. The strip
+    /// turns `dict[str, Any]` Pydantic fields into `{"type": "object"}`
+    /// with no declared keys, which Vertex interprets as "object must
+    /// be empty" — produces empty extractions on schemas that rely on
+    /// permissive objects (e.g. `extracted_data: dict`).
     #[serde(skip_serializing_if = "Option::is_none")]
     response_schema: Option<Value>,
+    /// Full JSON Schema. Supported by Gemini 3 family per Google's docs
+    /// (https://ai.google.dev/gemini-api/docs/structured-output). When
+    /// using this field, `additionalProperties`, `$defs`, `$ref`, etc.
+    /// are preserved — the model can emit arbitrary keys for permissive
+    /// object types. Selected via `model_supports_response_json_schema`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_json_schema: Option<Value>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -1988,6 +2012,7 @@ fn apply_inference_params(
                 seed: None,
                 response_mime_type: None,
                 response_schema: None,
+                response_json_schema: None,
             });
         }
     }
@@ -2035,17 +2060,37 @@ impl<'a> GCPVertexGeminiRequest<'a> {
         .filter(|m| !m.parts.is_empty())
         .collect();
         let (tools, tool_config) = prepare_tools(request, model_name)?;
-        let (response_mime_type, response_schema) = match request.json_mode {
+        let (response_mime_type, response_schema, response_json_schema) = match request.json_mode {
             ModelInferenceRequestJsonMode::On | ModelInferenceRequestJsonMode::Strict => {
                 match request.output_schema {
-                    Some(output_schema) => (
+                    Some(output_schema) => {
+                        // Gemini 3 family supports `responseJsonSchema` (full
+                        // JSON Schema). Older models only accept the OpenAPI
+                        // subset under `responseSchema` — strip unsupported
+                        // fields. See `model_supports_response_json_schema`
+                        // for the detection rule.
+                        if model_supports_response_json_schema(model_name) {
+                            (
+                                Some(GCPVertexGeminiResponseMimeType::ApplicationJson),
+                                None,
+                                Some(cleanup_jsonschema_for_response_json_schema(output_schema)),
+                            )
+                        } else {
+                            (
+                                Some(GCPVertexGeminiResponseMimeType::ApplicationJson),
+                                Some(process_jsonschema_for_gcp_vertex_gemini(output_schema)),
+                                None,
+                            )
+                        }
+                    }
+                    None => (
                         Some(GCPVertexGeminiResponseMimeType::ApplicationJson),
-                        Some(process_jsonschema_for_gcp_vertex_gemini(output_schema)),
+                        None,
+                        None,
                     ),
-                    None => (Some(GCPVertexGeminiResponseMimeType::ApplicationJson), None),
                 }
             }
-            ModelInferenceRequestJsonMode::Off => (None, None),
+            ModelInferenceRequestJsonMode::Off => (None, None, None),
         };
         let generation_config = Some(GCPVertexGeminiGenerationConfig {
             stop_sequences: request.borrow_stop_sequences(),
@@ -2058,6 +2103,7 @@ impl<'a> GCPVertexGeminiRequest<'a> {
             frequency_penalty: request.frequency_penalty,
             response_mime_type,
             response_schema,
+            response_json_schema,
         });
         // We attach our custom tag so that we can identify the original inference when
         // retrieving batch results.
@@ -2132,6 +2178,41 @@ fn prepare_tools<'a>(
         }
         None => Ok((None, None)),
     }
+}
+
+/// Convert a [`LazyFile`] to a Gemini part.
+///
+/// Vertex AI natively handles `gs://` URIs (all versions) and `https://` URLs
+/// (Gemini 2.5+) via `fileData.fileUri` — no download or base64 encoding needed.
+/// Only `data:` URIs and other schemes fall back to resolve + `inlineData`.
+async fn convert_file_to_gemini_part(
+    file: &LazyFile,
+) -> Result<GCPVertexGeminiPartData<'static>, Error> {
+    if let LazyFile::Url { file_url, .. } = file {
+        let scheme = file_url.url.scheme();
+        if scheme == "gs" || scheme == "https" {
+            let mime_type = match &file_url.mime_type {
+                Some(mt) => mt.to_string(),
+                None => mime_guess::from_path(file_url.url.path())
+                    .first_or_octet_stream()
+                    .to_string(),
+            };
+            return Ok(GCPVertexGeminiPartData::FileData {
+                file_data: GCPVertexFileData {
+                    mime_type,
+                    file_uri: file_url.url.to_string(),
+                },
+            });
+        }
+    }
+    let resolved_file = file.resolve().await?;
+    let ObjectStorageFile { file: meta, data } = &*resolved_file;
+    Ok(GCPVertexGeminiPartData::InlineData {
+        inline_data: GCPVertexInlineData {
+            mime_type: meta.mime_type.to_string(),
+            data: Cow::Owned(data.to_string()),
+        },
+    })
 }
 
 async fn convert_non_thought_content_block<'a>(
@@ -2250,32 +2331,12 @@ async fn convert_non_thought_content_block<'a>(
                 },
             ))
         }
-        Cow::Borrowed(ContentBlock::File(file)) => {
-            let resolved_file = file.resolve().await?;
-            let ObjectStorageFile { file, data } = &*resolved_file;
-
-            Ok(FlattenUnknown::Normal(
-                GCPVertexGeminiPartData::InlineData {
-                    inline_data: GCPVertexInlineData {
-                        mime_type: file.mime_type.to_string(),
-                        data: Cow::Owned(data.to_string()),
-                    },
-                },
-            ))
-        }
-        Cow::Owned(ContentBlock::File(file)) => {
-            let resolved_file = file.resolve().await?;
-            let ObjectStorageFile { file, data } = &*resolved_file;
-
-            Ok(FlattenUnknown::Normal(
-                GCPVertexGeminiPartData::InlineData {
-                    inline_data: GCPVertexInlineData {
-                        mime_type: file.mime_type.to_string(),
-                        data: Cow::Owned(data.to_string()),
-                    },
-                },
-            ))
-        }
+        Cow::Borrowed(ContentBlock::File(file)) => Ok(FlattenUnknown::Normal(
+            convert_file_to_gemini_part(file).await?,
+        )),
+        Cow::Owned(ContentBlock::File(file)) => Ok(FlattenUnknown::Normal(
+            convert_file_to_gemini_part(&file).await?,
+        )),
         Cow::Borrowed(ContentBlock::Unknown(Unknown { data, .. })) => {
             Ok(FlattenUnknown::Unknown(Cow::Borrowed(data)))
         }
@@ -2505,33 +2566,17 @@ pub async fn tensorzero_to_gcp_vertex_gemini_content<'a>(
                 });
             }
             Cow::Borrowed(ContentBlock::File(file)) => {
-                let resolved_file = file.resolve().await?;
-                let ObjectStorageFile { file, data } = &*resolved_file;
-
                 model_content_blocks.push(GCPVertexGeminiContentPart {
                     thought: false,
                     thought_signature: None,
-                    data: FlattenUnknown::Normal(GCPVertexGeminiPartData::InlineData {
-                        inline_data: GCPVertexInlineData {
-                            mime_type: file.mime_type.to_string(),
-                            data: Cow::Owned(data.to_string()),
-                        },
-                    }),
+                    data: FlattenUnknown::Normal(convert_file_to_gemini_part(file).await?),
                 });
             }
             Cow::Owned(ContentBlock::File(file)) => {
-                let resolved_file = file.resolve().await?;
-                let ObjectStorageFile { file, data } = &*resolved_file;
-
                 model_content_blocks.push(GCPVertexGeminiContentPart {
                     thought: false,
                     thought_signature: None,
-                    data: FlattenUnknown::Normal(GCPVertexGeminiPartData::InlineData {
-                        inline_data: GCPVertexInlineData {
-                            mime_type: file.mime_type.to_string(),
-                            data: Cow::Owned(data.to_string()), // Convert to owned String
-                        },
-                    }),
+                    data: FlattenUnknown::Normal(convert_file_to_gemini_part(&file).await?),
                 });
             }
             Cow::Borrowed(ContentBlock::Thought(thought)) => {
@@ -2591,11 +2636,65 @@ pub async fn tensorzero_to_gcp_vertex_gemini_content<'a>(
     Ok(message)
 }
 
+/// Returns `true` when the model accepts Vertex's full-JSON-Schema
+/// `responseJsonSchema` field (added by Google for Gemini 3+). For older
+/// models we fall back to the legacy OpenAPI-subset `responseSchema`.
+///
+/// The detection is intentionally narrow: only Gemini 3 family. Gemini
+/// 2.5 also supports `responseJsonSchema` in the public API, but our
+/// existing TZ tests + variant configs were all built around the strict
+/// `responseSchema` shape, so widening the rule risks behavior changes
+/// outside this fix's scope.
+pub(crate) fn model_supports_response_json_schema(model_name: &str) -> bool {
+    let lower = model_name.to_lowercase();
+    // gemini-3-flash-preview, gemini-3-pro-preview, gemini-3.1-*, etc.
+    lower.contains("gemini-3")
+}
+
+/// Light-touch cleanup for schemas emitted under `responseJsonSchema`.
+/// Vertex accepts standard JSON Schema here, so we only strip metadata
+/// fields the API explicitly rejects (`$schema`); `additionalProperties`,
+/// `$defs`, and `$ref` are preserved.
+pub(crate) fn cleanup_jsonschema_for_response_json_schema(schema: &Value) -> Value {
+    let mut schema = schema.clone();
+    fn cleanup(value: &mut Value) {
+        match value {
+            Value::Object(obj) => {
+                obj.remove("$schema");
+                for (_, v) in obj.iter_mut() {
+                    cleanup(v);
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr.iter_mut() {
+                    cleanup(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    cleanup(&mut schema);
+    schema
+}
+
 /// Recursively removes fields unsupported by Google's Schema spec
 /// (`$schema`, `additionalProperties`, bare `ref`) from JSON schemas.
+/// Also inlines Pydantic-style `$ref` pointers against the root `$defs`
+/// dictionary and strips `$defs`/`$ref` — Google rejects both as unknown
+/// fields but accepts the fully-resolved equivalent.
 pub(crate) fn process_jsonschema_for_gcp_vertex_gemini(schema: &Value) -> Value {
     let mut schema = schema.clone();
 
+    // Phase 1 — if the root schema carries `$defs`, walk the tree replacing
+    // every `{"$ref": "#/$defs/Name"}` with an inline copy of the target.
+    // Cap recursion to guard against self-referential schemas.
+    if let Value::Object(root) = &schema {
+        if root.contains_key("$defs") {
+            schema = inline_gcp_schema_refs(&schema);
+        }
+    }
+
+    // Phase 2 — strip remaining unsupported fields everywhere.
     fn remove_properties(value: &mut Value) {
         match value {
             Value::Object(obj) => {
@@ -2603,6 +2702,10 @@ pub(crate) fn process_jsonschema_for_gcp_vertex_gemini(schema: &Value) -> Value 
                 obj.remove("$schema");
                 // Bare "ref" (without $) is not a valid Google Schema field
                 obj.remove("ref");
+                // Any leftover $defs/$ref that survived inlining (e.g. bad
+                // refs, or nested $defs we intentionally didn't inline)
+                obj.remove("$defs");
+                obj.remove("$ref");
                 for (_, v) in obj.iter_mut() {
                     remove_properties(v);
                 }
@@ -2618,6 +2721,51 @@ pub(crate) fn process_jsonschema_for_gcp_vertex_gemini(schema: &Value) -> Value 
 
     remove_properties(&mut schema);
     schema
+}
+
+/// Replace `{"$ref": "#/$defs/Name"}` nodes with inline copies of the
+/// referenced schema. Resolves nested refs and drops `$defs` after.
+fn inline_gcp_schema_refs(schema: &Value) -> Value {
+    const MAX_DEPTH: usize = 16;
+
+    let defs = match schema.get("$defs") {
+        Some(Value::Object(m)) => m.clone(),
+        _ => return schema.clone(),
+    };
+
+    fn resolve(value: &Value, defs: &serde_json::Map<String, Value>, depth: usize) -> Value {
+        if depth >= MAX_DEPTH {
+            return value.clone();
+        }
+        match value {
+            Value::Object(obj) => {
+                // A plain `{"$ref": "#/$defs/Name"}` node — inline it.
+                if let Some(Value::String(ref_str)) = obj.get("$ref") {
+                    if let Some(name) = ref_str.strip_prefix("#/$defs/") {
+                        if let Some(target) = defs.get(name) {
+                            return resolve(target, defs, depth + 1);
+                        }
+                    }
+                }
+                // Otherwise copy the object, skipping the root-level $defs,
+                // and recurse into every value.
+                let mut out = serde_json::Map::new();
+                for (k, v) in obj {
+                    if k == "$defs" {
+                        continue;
+                    }
+                    out.insert(k.clone(), resolve(v, defs, depth));
+                }
+                Value::Object(out)
+            }
+            Value::Array(arr) => {
+                Value::Array(arr.iter().map(|v| resolve(v, defs, depth)).collect())
+            }
+            _ => value.clone(),
+        }
+    }
+
+    resolve(schema, &defs, 0)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -4554,6 +4702,94 @@ mod tests {
     }
 
     #[test]
+    fn test_model_supports_response_json_schema() {
+        // Gemini 3 family — should use responseJsonSchema
+        assert!(model_supports_response_json_schema(
+            "gemini-3-flash-preview"
+        ));
+        assert!(model_supports_response_json_schema("gemini-3-pro-preview"));
+        assert!(model_supports_response_json_schema(
+            "gemini-3.1-pro-preview"
+        ));
+        // Case-insensitive (model_id sometimes ships uppercased in configs)
+        assert!(model_supports_response_json_schema(
+            "GEMINI-3-FLASH-PREVIEW"
+        ));
+
+        // Older models — should keep the legacy responseSchema path
+        assert!(!model_supports_response_json_schema("gemini-2.5-flash"));
+        assert!(!model_supports_response_json_schema("gemini-2.0-flash"));
+        assert!(!model_supports_response_json_schema("gemini-1.5-pro"));
+        assert!(!model_supports_response_json_schema("claude-3-5-sonnet"));
+    }
+
+    #[test]
+    fn test_cleanup_jsonschema_for_response_json_schema_preserves_additional_properties() {
+        // The whole point of this fix: dict[str, Any] schemas (which Pydantic
+        // emits with `additionalProperties: true`) must keep that field so
+        // Gemini 3 will emit arbitrary keys instead of an empty object.
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "extracted_data": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "description": "Extracted key-value pairs from this location"
+                },
+                "page_number": {"type": "integer"}
+            },
+            "required": ["extracted_data", "page_number"]
+        });
+        let cleaned = cleanup_jsonschema_for_response_json_schema(&schema);
+        // $schema stripped (Vertex rejects metadata fields)
+        assert!(cleaned.get("$schema").is_none());
+        // additionalProperties preserved on inner extracted_data
+        let inner = &cleaned["properties"]["extracted_data"];
+        assert_eq!(inner["additionalProperties"], json!(true));
+        assert_eq!(inner["type"], json!("object"));
+    }
+
+    #[test]
+    fn test_cleanup_jsonschema_for_response_json_schema_preserves_defs_ref() {
+        // PortKey-style schema using $defs/$ref (cleaner than inlined).
+        // Gemini 3's responseJsonSchema accepts standard JSON Schema, so
+        // we don't need to inline like the old responseSchema path.
+        let schema = json!({
+            "$defs": {
+                "PDFPageExtractedData": {
+                    "type": "object",
+                    "properties": {
+                        "extracted_data": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            },
+            "type": "object",
+            "properties": {
+                "extracted_data": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/PDFPageExtractedData"}
+                }
+            }
+        });
+        let cleaned = cleanup_jsonschema_for_response_json_schema(&schema);
+        // $defs and $ref preserved
+        assert!(cleaned.get("$defs").is_some());
+        assert_eq!(
+            cleaned["properties"]["extracted_data"]["items"]["$ref"],
+            json!("#/$defs/PDFPageExtractedData")
+        );
+        // additionalProperties preserved inside $defs
+        assert_eq!(
+            cleaned["$defs"]["PDFPageExtractedData"]["properties"]["extracted_data"]["additionalProperties"],
+            json!(true)
+        );
+    }
+
+    #[test]
     fn test_tool_parameters_recursive_cleaning() {
         // Create a tool schema with nested $schema and additionalProperties
         let tool_schema_value = json!({
@@ -5755,5 +5991,45 @@ mod tests {
         expect_that!(usage.output_tokens, eq(Some(80)));
         expect_that!(usage.provider_cache_read_input_tokens, eq(Some(150)));
         expect_that!(usage.provider_cache_write_input_tokens, eq(None::<u32>));
+    }
+
+    #[test]
+    fn test_file_data_serialization() {
+        let part = GCPVertexGeminiPartData::FileData {
+            file_data: GCPVertexFileData {
+                mime_type: "application/pdf".to_string(),
+                file_uri: "gs://my-bucket/path/doc.pdf".to_string(),
+            },
+        };
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "file_data": {
+                    "mime_type": "application/pdf",
+                    "file_uri": "gs://my-bucket/path/doc.pdf"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn test_inline_data_serialization() {
+        let part = GCPVertexGeminiPartData::InlineData {
+            inline_data: GCPVertexInlineData {
+                mime_type: "image/png".to_string(),
+                data: Cow::Borrowed("AAAA"),
+            },
+        };
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "inline_data": {
+                    "mime_type": "image/png",
+                    "data": "AAAA"
+                }
+            })
+        );
     }
 }

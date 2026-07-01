@@ -557,6 +557,7 @@ fn tensorzero_to_mistral_assistant_message<'a>(
                         name: Cow::Borrowed(&tool_call.name),
                         arguments: Cow::Borrowed(&tool_call.arguments),
                     },
+                    extra_content: None,
                 });
             }
             ContentBlock::Thought(thought) => {
@@ -2117,6 +2118,7 @@ mod tests {
                     name: Cow::Borrowed("get_weather"),
                     arguments: Cow::Borrowed(r#"{"city":"Tokyo"}"#),
                 },
+                extra_content: None,
             }]),
         };
         let serialized = serde_json::to_string(&tool_only_msg).unwrap();

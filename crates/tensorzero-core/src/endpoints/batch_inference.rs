@@ -765,8 +765,11 @@ async fn write_start_batch_inference<'a>(
         let tool_params: Option<ToolCallConfigDatabaseInsert> =
             row.tool_config.map(|tc| tc.clone().into());
 
-        let resolved_input = row.input.clone().resolve().await?;
-        join_all(resolved_input.clone().write_all_files(config)).await;
+        let stored_input = row
+            .input
+            .clone()
+            .into_observability_stored_input(&config.object_store_info)
+            .await;
 
         Ok::<_, Error>(BatchModelInferenceRow {
             inference_id: *row.inference_id,
@@ -774,7 +777,7 @@ async fn write_start_batch_inference<'a>(
             function_name: metadata.function_name.into(),
             variant_name: metadata.variant_name.into(),
             episode_id: metadata.episode_ids[i],
-            input: Some(resolved_input.into_stored_input()),
+            input: Some(stored_input),
             input_messages: Some(
                 try_join_all(
                     row.input_messages

@@ -1,6 +1,6 @@
 import warnings
 from abc import ABC
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
 from json import JSONEncoder
 from typing import Any, Dict, List, Literal, Optional, Protocol, Union, cast
@@ -141,6 +141,9 @@ class ImageUrl(ContentBlock):
 class FileUrl(ContentBlock):
     url: str
     type: str = "file"
+    mime_type: Optional[str] = field(default=None, kw_only=True)
+    detail: Optional[Detail] = field(default=None, kw_only=True)
+    filename: Optional[str] = field(default=None, kw_only=True)
 
 
 @dataclass

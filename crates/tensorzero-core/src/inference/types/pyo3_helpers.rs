@@ -12,7 +12,7 @@ use crate::db::stored_datapoint::StoredDatapoint;
 use crate::endpoints::datasets::Datapoint;
 use crate::inference::types::stored_input::{StoredInput, StoredInputMessageContent};
 use crate::inference::types::{
-    ContentBlockChatOutput, ResolvedContentBlock, ResolvedInputMessageContent, Unknown,
+    ContentBlockChatOutput, Detail, ResolvedContentBlock, ResolvedInputMessageContent, Unknown,
 };
 use crate::optimization::UninitializedOptimizerConfig;
 use crate::optimization::dicl::UninitializedDiclOptimizationConfig;
@@ -84,6 +84,22 @@ fn import_file_content_block(py: Python<'_>) -> PyResult<&Py<PyAny>> {
         let self_module = PyModule::import(py, "tensorzero.types")?;
         Ok(self_module.getattr("FileBase64")?.unbind())
     })
+}
+
+fn import_file_url_content_block(py: Python<'_>) -> PyResult<&Py<PyAny>> {
+    static FILE_URL_CONTENT_BLOCK: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    FILE_URL_CONTENT_BLOCK.get_or_try_init::<_, PyErr>(py, || {
+        let self_module = PyModule::import(py, "tensorzero.types")?;
+        Ok(self_module.getattr("FileUrl")?.unbind())
+    })
+}
+
+fn detail_to_python_string(detail: &Detail) -> &'static str {
+    match detail {
+        Detail::Low => "low",
+        Detail::High => "high",
+        Detail::Auto => "auto",
+    }
 }
 
 fn import_tool_call_content_block(py: Python<'_>) -> PyResult<&Py<PyAny>> {
@@ -265,6 +281,15 @@ pub fn stored_input_message_content_to_python(
         StoredInputMessageContent::File(file) => {
             let file_content_block = import_file_content_block(py)?;
             file_content_block.call1(py, (PyNone::get(py), file.mime_type.to_string()))
+        }
+        StoredInputMessageContent::ExternalFile(file) => {
+            let file_content_block = import_file_url_content_block(py)?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("url", file.url.to_string())?;
+            kwargs.set_item("mime_type", file.mime_type_string())?;
+            kwargs.set_item("detail", file.detail.as_ref().map(detail_to_python_string))?;
+            kwargs.set_item("filename", file.filename)?;
+            file_content_block.call(py, (), Some(&kwargs))
         }
         StoredInputMessageContent::Unknown(unknown) => {
             let unknown_content_block = import_unknown_content_block(py)?;

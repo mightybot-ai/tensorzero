@@ -56,7 +56,7 @@ use crate::inference::types::{
     InferenceResultChunk, InferenceResultStream, Input, InputExt, InternalJsonInferenceOutput,
     JsonInferenceDatabaseInsert, JsonInferenceOutput, JsonInferenceResultChunk,
     ModelInferenceResponseWithMetadata, RawResponseEntry, RawUsageEntry, RequestMessage,
-    ResolvedInput, TextChunk, Usage, collect_chunks,
+    StoredInput, TextChunk, Usage, collect_chunks,
 };
 use crate::jsonschema_util::JSONSchema;
 use crate::minijinja_util::TemplateConfig;
@@ -963,10 +963,12 @@ async fn infer_variant(args: InferVariantArgs<'_>) -> Result<InferenceOutput, Er
                     postgres_connection_info,
                     primary_datastore,
                 );
-                let _: () = write_inference(
+                let stored_input = Arc::unwrap_or_clone(resolved_input)
+                    .into_observability_stored_input(&config.object_store_info)
+                    .await;
+                write_inference(
                     &database,
-                    &config,
-                    Arc::unwrap_or_clone(resolved_input).resolve().await?,
+                    stored_input,
                     result_to_write,
                     write_metadata,
                 )
@@ -1465,29 +1467,20 @@ fn create_stream(
                         extra_headers,
                         snapshot_hash: config.hash.clone(),
                     };
-                    let config = config.clone();
-                        match Arc::unwrap_or_clone(input).resolve().await {
-                            Ok(input) => {
-                                let database = DelegatingDatabaseConnection::new(
-                                    clickhouse_connection_info.clone(),
-                                    postgres_connection_info.clone(),
-                                    primary_datastore,
-                                );
-                                write_inference(
-                                    &database,
-                                    &config,
-                                    input,
-                                    inference_response,
-                                    write_metadata,
-                                ).await;
-                            },
-                            Err(e) => {
-                                tracing::error!("Failed to resolve input: {e:?}");
-
-                            }
-                        };
-
-
+                    let stored_input = Arc::unwrap_or_clone(input)
+                        .into_observability_stored_input(&config.object_store_info)
+                        .await;
+                    let database = DelegatingDatabaseConnection::new(
+                        clickhouse_connection_info.clone(),
+                        postgres_connection_info.clone(),
+                        primary_datastore,
+                    );
+                    write_inference(
+                        &database,
+                        stored_input,
+                        inference_response,
+                        write_metadata,
+                    ).await;
                 }
                 drop(clickhouse_connection_info);
                 drop(postgres_connection_info);
@@ -1663,8 +1656,7 @@ pub struct InferenceDatabaseInsertMetadata {
 
 async fn write_inference<T: InferenceQueries + ModelInferenceQueries + Send + Sync>(
     database: &T,
-    config: &Config,
-    input: ResolvedInput,
+    input: StoredInput,
     result: InferenceResult,
     metadata: InferenceDatabaseInsertMetadata,
 ) {
@@ -1675,8 +1667,7 @@ async fn write_inference<T: InferenceQueries + ModelInferenceQueries + Send + Sy
             metadata.snapshot_hash.clone(),
         )
         .await;
-    let mut futures: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> =
-        input.clone().write_all_files(config);
+    let mut futures: Vec<Pin<Box<dyn Future<Output = ()> + Send>>> = Vec::new();
     // Write the model inferences to the database (dual-write via ModelInferenceQueries trait)
     futures.push(
         async {
@@ -1688,15 +1679,13 @@ async fn write_inference<T: InferenceQueries + ModelInferenceQueries + Send + Sy
         // Write the inference to the Inference table (dual-write via InferenceQueries trait)
         match result {
             InferenceResult::Chat(result) => {
-                let stored_input = input.clone().into_stored_input();
                 let chat_inference =
-                    ChatInferenceDatabaseInsert::new(result, Some(stored_input), metadata);
+                    ChatInferenceDatabaseInsert::new(result, Some(input.clone()), metadata);
                 let _ = database.insert_chat_inferences(&[chat_inference]).await;
             }
             InferenceResult::Json(result) => {
-                let stored_input = input.clone().into_stored_input();
                 let json_inference =
-                    JsonInferenceDatabaseInsert::new(result, Some(stored_input), metadata);
+                    JsonInferenceDatabaseInsert::new(result, Some(input.clone()), metadata);
                 let _ = database.insert_json_inferences(&[json_inference]).await;
             }
         }

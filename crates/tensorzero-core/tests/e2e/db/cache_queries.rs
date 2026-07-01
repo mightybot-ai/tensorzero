@@ -98,7 +98,10 @@ async fn test_cache_write_and_read(conn: impl CacheQueries + Clone + 'static) {
             output_tokens: Some(16),
             finish_reason: Some(FinishReason::Stop),
         },
-        CacheValidationInfo { tool_config: None },
+        CacheValidationInfo {
+            tool_config: None,
+            finish_reason: Some(FinishReason::Stop),
+        },
     )
     .unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;

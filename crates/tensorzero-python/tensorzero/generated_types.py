@@ -649,6 +649,22 @@ class StoragePath:
 
 
 @dataclass(kw_only=True)
+class StoredExternalFile:
+    """
+    A file stored by reference to an external provider-visible URI.
+
+    This is used when a provider accepted the URI directly (for example Vertex
+    `gs://` or Gemini 2.5+ `https://`) and TensorZero never needed to fetch file
+    bytes. It deliberately does not pretend to be an object-storage pointer.
+    """
+
+    url: str
+    detail: Detail | None = None
+    filename: str | None = None
+    mime_type: str | None = None
+
+
+@dataclass(kw_only=True)
 class StoredInputMessageContentText:
     """
     InputMessages are validated against the input schema of the Function
@@ -709,6 +725,11 @@ class StoredInputMessageContentFile:
     detail: Detail | None = None
     filename: str | None = None
     source_url: str | None = None
+
+
+@dataclass(kw_only=True)
+class StoredInputMessageContentExternalFile(StoredExternalFile):
+    type: Literal["external_file"] = "external_file"
 
 
 System = str | dict[str, Any]
@@ -1363,6 +1384,7 @@ StoredInputMessageContent = (
     | StoredInputMessageContentRawText
     | StoredInputMessageContentThought
     | StoredInputMessageContentFile
+    | StoredInputMessageContentExternalFile
     | StoredInputMessageContentUnknown
 )
 
