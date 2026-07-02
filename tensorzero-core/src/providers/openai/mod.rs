@@ -2036,16 +2036,15 @@ pub(super) async fn prepare_file_message(
                     },
                 })
             } else {
-                // Send non-image/non-audio files (PDFs, documents, etc.) as `image_url`
-                // with a data URI. This is necessary because some OpenAI-compatible
-                // endpoints (notably Vertex AI) don't support the `file` content block
-                // type, but DO accept data URIs with non-image mime types in `image_url`
-                // blocks. Real OpenAI also accepts this format.
-                // See: https://github.com/tensorzero/tensorzero/discussions/7159
-                Ok(OpenAIContentBlock::ImageUrl {
-                    image_url: OpenAIImageUrl {
-                        url: base64_url,
-                        detail: None,
+                let filename = match file.filename.as_ref() {
+                    Some(filename) => Some(Cow::Owned(filename.clone())),
+                    None => mime_type_to_ext(&file.mime_type)?
+                        .map(|extension| Cow::Owned(format!("input.{extension}"))),
+                };
+                Ok(OpenAIContentBlock::File {
+                    file: OpenAIFile {
+                        file_data: Some(Cow::Owned(base64_url)),
+                        filename,
                     },
                 })
             }
