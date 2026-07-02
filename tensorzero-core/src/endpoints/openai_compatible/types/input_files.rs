@@ -28,15 +28,19 @@ pub struct OpenAICompatibleImageUrl {
 
 /// OpenAI-compatible file content block.
 ///
-/// Represents a file with base64-encoded data URL and optional filename.
-/// OpenAI supports file_id with their files API, but we require the file data directly.
+/// Represents either OpenAI file data or a TensorZero URL-backed file extension.
 #[derive(Deserialize, Debug)]
 pub struct OpenAICompatibleFile {
-    pub file_data: String,
+    #[serde(default)]
+    pub file_data: Option<String>,
     #[serde(default)]
     pub filename: Option<String>,
-    // OpenAI supports file_id with their files API
-    // We do not so we require these two fields
+    #[serde(default, rename = "tensorzero::file_url")]
+    pub file_url: Option<Url>,
+    #[serde(default, rename = "tensorzero::mime_type")]
+    pub mime_type: Option<MediaType>,
+    // OpenAI supports file_id with their files API. TensorZero requires actual
+    // file content or a URL it can route to the selected provider.
 }
 
 /// OpenAI-compatible input audio content block.
@@ -107,14 +111,39 @@ pub fn convert_image_url_to_file(image_url: OpenAICompatibleImageUrl) -> Result<
     }
 }
 
-/// Converts an OpenAI-compatible file to TensorZero's Base64File.
+/// Converts an OpenAI-compatible file block to TensorZero's File type.
 ///
-/// Parses the data URL and extracts MIME type and base64 data.
-pub fn convert_file_to_base64(file: OpenAICompatibleFile) -> Result<File, Error> {
-    let (mime_type, data) = parse_base64_file_data_url(&file.file_data)?;
-    let base64_file =
-        Base64File::new(None, Some(mime_type), data.to_string(), None, file.filename)?;
-    Ok(File::Base64(base64_file))
+/// Standard OpenAI file blocks use base64 data URLs. TensorZero additionally
+/// accepts `tensorzero::file_url` so callers can pass GCS/HTTPS documents
+/// without pretending they are image URLs.
+pub fn convert_file_block_to_file(file: OpenAICompatibleFile) -> Result<File, Error> {
+    match (file.file_data, file.file_url) {
+        (Some(file_data), None) => {
+            let (mime_type, data) = parse_base64_file_data_url(&file_data)?;
+            let base64_file =
+                Base64File::new(None, Some(mime_type), data.to_string(), None, file.filename)?;
+            Ok(File::Base64(base64_file))
+        }
+        (None, Some(file_url)) => {
+            let Some(mime_type) = file.mime_type else {
+                return Err(Error::new(ErrorDetails::InvalidOpenAICompatibleRequest {
+                    message: "`file` content blocks using `tensorzero::file_url` must specify `tensorzero::mime_type`.".to_string(),
+                }));
+            };
+            Ok(File::Url(UrlFile {
+                url: file_url,
+                mime_type: Some(mime_type),
+                detail: None,
+                filename: file.filename,
+            }))
+        }
+        (Some(_), Some(_)) => Err(Error::new(ErrorDetails::InvalidOpenAICompatibleRequest {
+            message: "`file` content blocks must specify only one of `file_data` or `tensorzero::file_url`.".to_string(),
+        })),
+        (None, None) => Err(Error::new(ErrorDetails::InvalidOpenAICompatibleRequest {
+            message: "`file` content blocks must specify either `file_data` or `tensorzero::file_url`.".to_string(),
+        })),
+    }
 }
 
 /// Converts OpenAI-compatible input audio to TensorZero's Base64File.
@@ -538,7 +567,10 @@ mod tests {
         match block {
             OpenAICompatibleContentBlock::File { file } => {
                 assert_eq!(file.filename, Some("my_config.txt".to_string()));
-                assert_eq!(file.file_data, "data:text/plain;base64,SGVsbG8h");
+                assert_eq!(
+                    file.file_data,
+                    Some("data:text/plain;base64,SGVsbG8h".to_string())
+                );
             }
             _ => panic!("Expected File variant"),
         }
@@ -554,10 +586,83 @@ mod tests {
         match block {
             OpenAICompatibleContentBlock::File { file } => {
                 assert_eq!(file.filename, None);
-                assert_eq!(file.file_data, "data:application/pdf;base64,JVBERi0xLjQ=");
+                assert_eq!(
+                    file.file_data,
+                    Some("data:application/pdf;base64,JVBERi0xLjQ=".to_string())
+                );
             }
             _ => panic!("Expected File variant"),
         }
+    }
+
+    #[test]
+    fn test_openai_file_with_tensorzero_file_url() {
+        let messages = vec![OpenAICompatibleMessage::User(OpenAICompatibleUserMessage {
+            content: json!([
+                {
+                    "type": "file",
+                    "file": {
+                        "tensorzero::file_url": "gs://bucket/path/report.pdf",
+                        "tensorzero::mime_type": "application/pdf",
+                        "filename": "report.pdf"
+                    }
+                }
+            ]),
+        })];
+        let input: Input = openai_messages_to_input(messages).unwrap();
+
+        match &input.messages[0].content[0] {
+            InputMessageContent::File(File::Url(url_file)) => {
+                assert_eq!(url_file.url.as_str(), "gs://bucket/path/report.pdf");
+                assert_eq!(url_file.mime_type, Some(mime::APPLICATION_PDF));
+                assert_eq!(url_file.filename, Some("report.pdf".to_string()));
+            }
+            other => panic!("Expected URL file from tensorzero::file_url, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_openai_file_requires_exactly_one_source() {
+        let both_sources = vec![OpenAICompatibleMessage::User(OpenAICompatibleUserMessage {
+            content: json!([
+                {
+                    "type": "file",
+                    "file": {
+                        "file_data": "data:application/pdf;base64,JVBERi0xLjQ=",
+                        "tensorzero::file_url": "gs://bucket/path/report.pdf"
+                    }
+                }
+            ]),
+        })];
+        assert!(openai_messages_to_input(both_sources).is_err());
+
+        let missing_source = vec![OpenAICompatibleMessage::User(OpenAICompatibleUserMessage {
+            content: json!([
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": "report.pdf"
+                    }
+                }
+            ]),
+        })];
+        assert!(openai_messages_to_input(missing_source).is_err());
+    }
+
+    #[test]
+    fn test_openai_file_url_requires_mime_type() {
+        let missing_mime_type = vec![OpenAICompatibleMessage::User(OpenAICompatibleUserMessage {
+            content: json!([
+                {
+                    "type": "file",
+                    "file": {
+                        "tensorzero::file_url": "gs://bucket/path/report.pdf"
+                    }
+                }
+            ]),
+        })];
+
+        assert!(openai_messages_to_input(missing_mime_type).is_err());
     }
 
     #[test]

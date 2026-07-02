@@ -898,12 +898,6 @@ async fn tensorzero_to_openai_responses_user_messages<'a>(
                             }),
                         ));
                     }
-                    // NOTE: `prepare_file_message` no longer produces `File` blocks for
-                    // non-image/non-audio files (it uses `ImageUrl` with data URIs instead
-                    // for Chat Completions compatibility). This arm is kept for safety but
-                    // may be unreachable in practice. If the Responses API needs dedicated
-                    // `File` block support in the future, revisit `prepare_file_message`.
-                    // See: https://github.com/tensorzero/tensorzero/discussions/7159
                     OpenAIContentBlock::File { file } => {
                         messages.push(OpenAIResponsesInput::Known(
                             OpenAIResponsesInputInner::Message(OpenAIResponsesInputMessage {

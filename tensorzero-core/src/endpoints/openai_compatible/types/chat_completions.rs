@@ -20,7 +20,7 @@ use crate::endpoints::inference::{
 };
 use crate::endpoints::openai_compatible::types::input_files::{
     OpenAICompatibleFile, OpenAICompatibleImageUrl, OpenAICompatibleInputAudio,
-    convert_file_to_base64, convert_image_url_to_file, convert_input_audio_to_file,
+    convert_file_block_to_file, convert_image_url_to_file, convert_input_audio_to_file,
 };
 use crate::endpoints::openai_compatible::types::tool::{
     ChatCompletionToolChoiceOption, OpenAICompatibleTool, OpenAICompatibleToolCall,
@@ -719,7 +719,7 @@ pub fn convert_openai_message_content(
                         InputMessageContent::File(convert_image_url_to_file(image_url)?)
                     }
                     Ok(OpenAICompatibleContentBlock::File { file }) => {
-                        InputMessageContent::File(convert_file_to_base64(file)?)
+                        InputMessageContent::File(convert_file_block_to_file(file)?)
                     }
                     Ok(OpenAICompatibleContentBlock::InputAudio { input_audio }) => {
                         InputMessageContent::File(convert_input_audio_to_file(input_audio)?)
